@@ -26,3 +26,6 @@ jobs:
         run: |
           cp .env.example .env
           docker compose config > /dev/null
+
+      - name: Build Docker image
+        run: docker build -t m3u-whats-new:test .
