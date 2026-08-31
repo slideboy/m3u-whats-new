@@ -2,9 +2,9 @@
 
 [English](README.md)
 
-M3U What's New est une petite application Docker qui surveille un catalogue VOD et Séries compatible Xtream et affiche ce qui a changé depuis les scans précédents.
+M3U What's New est une application Docker légère qui surveille un catalogue VOD et Séries compatible Xtream et affiche ce qui a changé depuis les scans précédents.
 
-Elle ne lit ni ne proxyfie les flux : elle surveille les métadonnées du catalogue exposées par l'API du fournisseur.
+Elle ne lit ni ne retransmet les flux : elle surveille uniquement les métadonnées du catalogue exposées par l'API du fournisseur.
 
 ## Fonctionnalités
 
@@ -21,9 +21,19 @@ Elle ne lit ni ne proxyfie les flux : elle surveille les métadonnées du catalo
 - Interface et emails en français ou en anglais.
 - Identifiants fournisseur et SMTP conservés hors de SQLite.
 
-### Installation avec Dockhand / Portainer
+## Installation rapide — Dockhand / Portainer / stack Compose
 
-Créez une nouvelle Stack et collez le Compose suivant :
+C'est la méthode d'installation recommandée.
+
+L'image Docker publiée contient déjà l'application :
+
+```text
+ghcr.io/slideboy/m3u-whats-new:latest
+```
+
+Il n'est **pas nécessaire** de télécharger `watcher.py`, de créer manuellement un dossier pour l'application ou de créer `config.json`.
+
+Dans Dockhand ou Portainer, créez une nouvelle Stack et collez le Compose suivant :
 
 ```yaml
 services:
@@ -58,32 +68,102 @@ volumes:
     name: m3u-whats-new-data
 ```
 
-Si vous avez modifié `M3U_WHATS_NEW_PORT`, utilisez ce port côté hôte.
+### Variables d'environnement
 
-Au premier démarrage, le conteneur crée automatiquement `/data/config.json` et la base SQLite dans le volume Docker persistant `m3u-whats-new-data`.
+Avant de déployer la Stack, renseignez dans Dockhand ou Portainer les variables d'environnement suivantes :
+
+```env
+M3U_PROVIDER_URL=https://votre-fournisseur.example
+M3U_USERNAME=votre_identifiant
+M3U_PASSWORD=votre_mot_de_passe
+```
+
+Variables facultatives :
+
+```env
+M3U_WHATS_NEW_PORT=36401
+TZ=Europe/Paris
+SMTP_USERNAME=
+SMTP_PASSWORD=
+```
+
+`M3U_PROVIDER_URL`, `M3U_USERNAME` et `M3U_PASSWORD` sont obligatoires.
+
+`M3U_WHATS_NEW_PORT` est facultatif. S'il n'est pas renseigné, l'application est accessible sur le port `36401`.
+
+`TZ` est facultatif et utilise `Europe/Paris` par défaut.
+
+`SMTP_USERNAME` et `SMTP_PASSWORD` sont uniquement nécessaires si vous souhaitez utiliser les notifications email avec authentification SMTP.
+
+Avec les variables d'environnement de Dockhand ou Portainer, **aucun fichier `.env` local n'est nécessaire**.
+
+Déployez ensuite la Stack puis ouvrez :
+
+```text
+http://IP-DE-VOTRE-SERVEUR:36401
+```
+
+Si vous avez modifié `M3U_WHATS_NEW_PORT`, utilisez le port choisi.
+
+Par exemple, avec :
+
+```env
+M3U_WHATS_NEW_PORT=36402
+```
+
+ouvrez :
+
+```text
+http://IP-DE-VOTRE-SERVEUR:36402
+```
+
+Au premier démarrage, le conteneur crée automatiquement `/data/config.json` ainsi que la base SQLite dans le volume Docker persistant `m3u-whats-new-data`.
 
 ## Docker Compose en ligne de commande
 
-Clonez ou téléchargez le dépôt puis :
+Si vous préférez utiliser la ligne de commande, clonez ou téléchargez le dépôt.
+
+Créez votre fichier d'environnement local :
 
 ```bash
 cp .env.example .env
 ```
 
-Modifiez `.env`, puis démarrez :
+Modifiez `.env` et renseignez les identifiants de votre fournisseur.
+
+Démarrez ensuite l'application :
 
 ```bash
 docker compose up -d
+```
+
+Consultez les logs :
+
+```bash
 docker compose logs --tail=100
 ```
 
-Docker Compose lit automatiquement le fichier `.env` local. Ne le publiez jamais.
+Docker Compose lit automatiquement le fichier `.env` local.
+
+Ne publiez et ne commitez jamais votre fichier `.env`.
+
+Ouvrez ensuite :
+
+```text
+http://IP-DE-VOTRE-SERVEUR:36401
+```
+
+ou utilisez le port défini avec `M3U_WHATS_NEW_PORT`.
 
 ## Premier démarrage
 
-Le premier scan découvre les catégories proposées par votre fournisseur. Aucun pays n'est imposé par défaut.
+Le premier scan découvre les catégories proposées par votre fournisseur.
 
-Ouvrez **Paramètres**, activez le pays ou la zone souhaitée, sélectionnez les catégories Films et Séries à surveiller puis enregistrez. Le contenu déjà présent est d'abord absorbé comme référence ; seuls les ajouts ultérieurs apparaissent comme de vraies nouveautés.
+Aucun pays ou aucune zone n'est activé par défaut sur une nouvelle installation.
+
+Ouvrez **Paramètres**, activez le pays ou la zone souhaitée, sélectionnez les catégories Films et Séries à surveiller puis enregistrez.
+
+Le contenu déjà présent dans le catalogue est d'abord absorbé comme référence. Seuls les ajouts ultérieurs apparaissent ensuite comme de véritables nouveautés, ce qui évite de générer des milliers de faux événements lors de l'activation initiale.
 
 ## Notifications email
 
@@ -96,29 +176,33 @@ SMTP_PASSWORD=votre-mot-de-passe-application
 
 Le serveur SMTP, le port, STARTTLS/SSL, l'expéditeur, les destinataires, la fréquence des récapitulatifs et les types de notifications se règlent depuis l'interface web.
 
-Après modification des variables d'environnement de la stack, redéployez/recréez le conteneur pour charger les nouvelles valeurs.
+Après modification des variables d'environnement de la Stack, recréez ou redéployez le conteneur afin que les nouvelles valeurs soient prises en compte.
 
 ## Données persistantes
 
-L'image Docker stocke ses données dans `/data`, relié au volume Docker nommé :
+Les données persistantes de l'application sont stockées dans `/data` à l'intérieur du conteneur et sauvegardées dans le volume Docker nommé :
 
 ```text
 m3u-whats-new-data
 ```
 
-Il contient :
+Il contient notamment :
 
-- `config.json` — valeurs par défaut non sensibles, créé automatiquement au premier démarrage.
+- `config.json` — paramètres non sensibles de l'application, créé automatiquement au premier démarrage.
 - `nouveautes.sqlite3` — base SQLite active.
 - `backups/` — sauvegardes SQLite gérées par l'application.
 
-Supprimer/recréer le conteneur ne supprime pas ce volume. En revanche, supprimer le volume **efface** la base et les sauvegardes de l'application.
+Supprimer ou recréer le conteneur ne supprime **pas** ce volume.
 
-Le nom interne historique `nouveautes.sqlite3` est volontairement conservé pour la compatibilité.
+En revanche, supprimer le volume Docker **efface la base de données, les paramètres, l'historique et les sauvegardes de l'application**.
+
+Le nom interne historique `nouveautes.sqlite3` est volontairement conservé pour assurer la compatibilité.
+
+Si vous préférez conserver les données persistantes dans un dossier visible de l'hôte, par exemple `/srv/m3u-whats-new`, vous pouvez remplacer le volume Docker nommé par un bind mount dans votre propre configuration Compose.
 
 ## Mise à jour
 
-Avec un gestionnaire de stack, récupérez la nouvelle image puis redéployez la stack.
+Avec Dockhand ou Portainer, récupérez la dernière image puis redéployez la Stack.
 
 En ligne de commande :
 
@@ -127,31 +211,44 @@ docker compose pull
 docker compose up -d
 ```
 
-Le volume Docker persistant est conservé.
+Le volume Docker persistant est conservé lors des mises à jour normales du conteneur.
 
 ## Construction locale
 
-Pour construire l'image depuis les sources au lieu d'utiliser GHCR :
+Si vous souhaitez construire l'image depuis les sources au lieu d'utiliser l'image publiée sur GHCR :
 
 ```bash
 docker build -t m3u-whats-new:local .
 ```
 
-L'image officielle est construite automatiquement par GitHub Actions pour `linux/amd64` et `linux/arm64`.
+L'image officielle est construite automatiquement depuis ce dépôt par GitHub Actions pour :
+
+```text
+linux/amd64
+linux/arm64
+```
 
 ## Sécurité
 
-L'interface web ne possède actuellement aucune authentification intégrée. Ne l'exposez **pas directement sur Internet**. Pour un accès distant, utilisez un VPN ou un reverse proxy avec authentification.
+L'interface web ne possède actuellement aucune authentification intégrée.
 
-Ne publiez jamais `.env`, les bases SQLite ou les fichiers de sauvegarde. Consultez [SECURITY.md](SECURITY.md).
+Ne l'exposez **pas directement sur Internet**. Pour un accès distant, utilisez un VPN ou un reverse proxy avec authentification.
+
+Ne publiez jamais `.env`, les bases SQLite ou les fichiers de sauvegarde.
+
+Consultez [SECURITY.md](SECURITY.md).
 
 ## Support et contributions
 
-Les issues et pull requests sont les bienvenues. Le projet est maintenu selon les disponibilités : aucun délai de support, calendrier de maintenance ou développement futur n'est garanti.
+Les issues et pull requests sont les bienvenues.
+
+Ce projet communautaire est proposé selon les disponibilités. Aucun délai de support, calendrier de maintenance ou développement futur n'est garanti.
 
 ## Avertissement
 
-M3U What's New est un projet indépendant, sans affiliation avec Xtream Codes, les fournisseurs IPTV ou M3U Editor. Utilisez-le uniquement avec des services et sources de données auxquels vous êtes autorisé à accéder.
+M3U What's New est un projet indépendant, sans affiliation avec Xtream Codes, les fournisseurs IPTV ou M3U Editor.
+
+Utilisez-le uniquement avec des services et des sources de données auxquels vous êtes autorisé à accéder.
 
 ## Licence
 
