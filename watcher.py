@@ -200,6 +200,11 @@ def load_config():
     cfg.setdefault("request_timeout_seconds", 25)
     cfg.setdefault("port", 36401)
     cfg.setdefault("timezone", "Europe/Paris")
+    # En déploiement par stack, TZ permet de régler le fuseau sans devoir
+    # modifier le fichier config.json stocké dans le volume Docker.
+    runtime_timezone = env_text("TZ", cfg.get("timezone", "Europe/Paris")).strip()
+    if runtime_timezone:
+        cfg["timezone"] = runtime_timezone
     cfg.setdefault("user_agent", APP_USER_AGENT)
 
     cfg["provider_url"] = cfg["provider_url"].rstrip("/")
