@@ -1,18 +1,29 @@
-# Fresh installation test checklist
+# Fresh install validation / Validation d'installation neuve
 
-This file is mainly intended for release validation before publishing a version.
+This checklist validates the same path a new Dockhand/Portainer user would follow.
 
-1. Start from an empty directory containing only the repository files.
-2. Copy `.env.example` to `.env` and fill in valid provider credentials.
-3. Run `docker compose up -d`.
-4. Confirm the container is named `m3u-whats-new` and the web page opens.
-5. Confirm the first provider scan completes without errors.
-6. Open Settings and verify that provider countries/zones and categories are discovered.
-7. Enable one country and a small set of VOD/Series categories and save.
-8. Confirm the baseline is created without reporting the existing catalogue as new content.
-9. Run a manual scan and confirm scan timestamps update.
-10. Run a manual SQLite backup and confirm a file appears in `data/backups/`.
-11. If SMTP is configured, send a test email.
-12. Switch FR/EN and verify both UI and email language.
-13. Restart the container and confirm settings persist.
-14. Reboot the Docker host and confirm settings, scans, backups and categories persist.
+## Before the test
+
+- Keep a safe copy of any existing installation and `.env`.
+- Do not reuse the previous SQLite database or Docker data volume.
+- Make sure the GHCR package `ghcr.io/slideboy/m3u-whats-new` is public.
+
+## Stack install
+
+1. Create a new stack from `docker-compose.yml`.
+2. Set `M3U_PROVIDER_URL`, `M3U_USERNAME`, `M3U_PASSWORD`.
+3. Optionally set SMTP credentials and `TZ`.
+4. Deploy.
+5. Confirm the container becomes healthy and the web page opens.
+6. Confirm logs show that `/data/config.json` was created on first start.
+7. Confirm the provider catalogue is discovered.
+8. Enable one country and a small set of VOD/Series categories.
+9. Run a manual scan and verify the baseline does not create false historical events.
+10. Run a manual SQLite backup.
+11. Configure SMTP in the UI and send a test email if desired.
+12. Restart the container and confirm settings persist.
+13. Redeploy the stack and confirm the named volume preserves settings and backups.
+
+## Clean uninstall test
+
+To simulate a truly new user again, remove both the container/stack **and** the Docker volume `m3u-whats-new-data`. Removing only the container is not a fresh install because the database remains in the volume.
