@@ -4,7 +4,7 @@
 
 M3U What's New est une petite application Docker qui surveille un catalogue VOD et Séries compatible Xtream et affiche ce qui a changé depuis les scans précédents.
 
-Le projet est indépendant et destiné à un usage communautaire. Il ne lit ni ne proxyfie les flux : il surveille les métadonnées du catalogue exposées par l'API du fournisseur.
+Elle ne lit ni ne proxyfie les flux : elle surveille les métadonnées du catalogue exposées par l'API du fournisseur.
 
 ## Fonctionnalités
 
@@ -13,33 +13,19 @@ Le projet est indépendant et destiné à un usage communautaire. Il ne lit ni n
 - Sélection du suivi par pays et par catégorie.
 - Détection des nouveaux films, nouvelles séries et nouveaux épisodes.
 - Détection des ajouts, suppressions et renommages de catégories, ainsi que des suppressions de contenus confirmées.
-- Création sûre d'une référence lors de l'activation d'une catégorie afin d'éviter des milliers de fausses nouveautés.
-- Historique Aujourd'hui, 7 jours et 30 jours, avec rétention des événements pendant 45 jours.
+- Création sûre d'une référence lors de l'activation d'une catégorie.
+- Historique Aujourd'hui, 7 jours et 30 jours avec rétention des événements pendant 45 jours.
 - Périodicité de scan configurable et scan manuel.
 - Sauvegardes SQLite intégrées avec planification, rotation et sauvegarde manuelle.
 - Notifications email SMTP immédiates ou regroupées en récapitulatifs périodiques.
 - Interface et emails en français ou en anglais.
-- Identifiants fournisseur et SMTP conservés dans `.env`, jamais dans SQLite ni dans `config.json`.
+- Identifiants fournisseur et SMTP conservés hors de SQLite.
 
-## Prérequis
+## Installation rapide — Dockhand / Portainer / stack Compose
 
-- Docker
-- Docker Compose v2 (`docker compose`)
-- Un accès autorisé à une API fournisseur compatible Xtream
+C'est la méthode recommandée. L'image Docker publiée contient déjà l'application : il n'est pas nécessaire de télécharger `watcher.py` ni de créer `config.json` à la main.
 
-Aucun paquet Python n'est à installer sur l'hôte. L'application utilise uniquement la bibliothèque standard Python dans le conteneur.
-
-## Installation
-
-1. Téléchargez ou clonez ce dépôt.
-2. Placez-vous dans le dossier du projet.
-3. Créez votre fichier d'environnement privé :
-
-```bash
-cp .env.example .env
-```
-
-4. Modifiez `.env` et renseignez au minimum :
+Créez une nouvelle stack et collez le [`docker-compose.yml`](docker-compose.yml) du dépôt. Dans les variables d'environnement de votre gestionnaire de stack, renseignez au minimum :
 
 ```env
 M3U_PROVIDER_URL=https://votre-fournisseur.example
@@ -47,37 +33,51 @@ M3U_USERNAME=votre_identifiant
 M3U_PASSWORD=votre_mot_de_passe
 ```
 
-5. Démarrez l'application :
+Variables facultatives :
 
-```bash
-docker compose up -d
+```env
+SMTP_USERNAME=
+SMTP_PASSWORD=
+M3U_WHATS_NEW_PORT=36401
+TZ=Europe/Paris
 ```
 
-6. Vérifiez les logs :
-
-```bash
-docker compose logs --tail=100
-```
-
-7. Ouvrez :
+Déployez la stack puis ouvrez :
 
 ```text
 http://IP-DE-VOTRE-SERVEUR:36401
 ```
 
-Si vous avez modifié `M3U_WHATS_NEW_PORT` dans `.env`, utilisez ce port côté hôte.
+Si vous avez modifié `M3U_WHATS_NEW_PORT`, utilisez ce port côté hôte.
 
-Le fuseau horaire utilisé par l’application se règle dans `data/config.json` (`Europe/Paris` par défaut). Si nécessaire, remplacez-le par un fuseau IANA valide, par exemple `Europe/London` ou `America/New_York`. La valeur `TZ` de `.env` règle le fuseau du conteneur.
+Au premier démarrage, le conteneur crée automatiquement `/data/config.json` et la base SQLite dans le volume Docker persistant `m3u-whats-new-data`.
+
+## Docker Compose en ligne de commande
+
+Clonez ou téléchargez le dépôt puis :
+
+```bash
+cp .env.example .env
+```
+
+Modifiez `.env`, puis démarrez :
+
+```bash
+docker compose up -d
+docker compose logs --tail=100
+```
+
+Docker Compose lit automatiquement le fichier `.env` local. Ne le publiez jamais.
 
 ## Premier démarrage
 
-Sur une installation neuve, le premier scan découvre les catégories proposées par le fournisseur. Aucun pays n'est imposé par défaut.
+Le premier scan découvre les catégories proposées par votre fournisseur. Aucun pays n'est imposé par défaut.
 
-Ouvrez **Paramètres**, activez le pays ou la zone souhaitée, sélectionnez les catégories Films et Séries à surveiller puis enregistrez. Le contenu déjà présent dans une catégorie nouvellement activée est d'abord absorbé comme référence ; seuls les ajouts ultérieurs apparaissent comme de vraies nouveautés.
+Ouvrez **Paramètres**, activez le pays ou la zone souhaitée, sélectionnez les catégories Films et Séries à surveiller puis enregistrez. Le contenu déjà présent est d'abord absorbé comme référence ; seuls les ajouts ultérieurs apparaissent comme de vraies nouveautés.
 
 ## Notifications email
 
-Le nom d'utilisateur et le mot de passe SMTP sont lus uniquement depuis `.env` :
+Le nom d'utilisateur et le mot de passe SMTP sont fournis uniquement via les variables d'environnement :
 
 ```env
 SMTP_USERNAME=votre-utilisateur-smtp
@@ -86,35 +86,48 @@ SMTP_PASSWORD=votre-mot-de-passe-application
 
 Le serveur SMTP, le port, STARTTLS/SSL, l'expéditeur, les destinataires, la fréquence des récapitulatifs et les types de notifications se règlent depuis l'interface web.
 
-Après une modification des identifiants SMTP dans `.env`, recréez le conteneur :
+Après modification des variables d'environnement de la stack, redéployez/recréez le conteneur pour charger les nouvelles valeurs.
 
-```bash
-docker compose up -d --force-recreate
+## Données persistantes
+
+L'image Docker stocke ses données dans `/data`, relié au volume Docker nommé :
+
+```text
+m3u-whats-new-data
 ```
 
-## Données et sauvegardes
+Il contient :
 
-Les données persistantes sont stockées dans `./data` sur l'hôte Docker.
+- `config.json` — valeurs par défaut non sensibles, créé automatiquement au premier démarrage.
+- `nouveautes.sqlite3` — base SQLite active.
+- `backups/` — sauvegardes SQLite gérées par l'application.
 
-On y trouve notamment :
+Supprimer/recréer le conteneur ne supprime pas ce volume. En revanche, supprimer le volume **efface** la base et les sauvegardes de l'application.
 
-- `data/config.json` — réglages par défaut non sensibles
-- `data/nouveautes.sqlite3` — base SQLite active, créée automatiquement
-- `data/backups/` — sauvegardes SQLite gérées par l'application
-
-La base et les sauvegardes sont ignorées par Git et ne doivent jamais être publiées.
-
-Le nom interne historique `nouveautes.sqlite3` est volontairement conservé pour assurer la compatibilité avec les installations existantes.
+Le nom interne historique `nouveautes.sqlite3` est volontairement conservé pour la compatibilité.
 
 ## Mise à jour
 
-Après une mise à jour du dépôt, la commande la plus sûre est :
+Avec un gestionnaire de stack, récupérez la nouvelle image puis redéployez la stack.
+
+En ligne de commande :
 
 ```bash
-docker compose up -d --force-recreate
+docker compose pull
+docker compose up -d
 ```
 
-La base, les paramètres et les sauvegardes restent dans `./data`.
+Le volume Docker persistant est conservé.
+
+## Construction locale
+
+Pour construire l'image depuis les sources au lieu d'utiliser GHCR :
+
+```bash
+docker build -t m3u-whats-new:local .
+```
+
+L'image officielle est construite automatiquement par GitHub Actions pour `linux/amd64` et `linux/arm64`.
 
 ## Sécurité
 
