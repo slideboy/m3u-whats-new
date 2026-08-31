@@ -23,9 +23,52 @@ It does **not** play or proxy streams. It monitors catalogue metadata exposed by
 
 ## Quick install — Dockhand / Portainer / Compose stack
 
-The recommended installation uses the published container image. You do **not** need to download `watcher.py` or create `config.json` manually.
+The recommended installation uses the published Docker image:
 
-Create a new stack and paste the repository's [`docker-compose.yml`](docker-compose.yml). In your stack manager, define at least:
+```text
+ghcr.io/slideboy/m3u-whats-new:latest
+```
+
+You do **not** need to download `watcher.py`, create application folders, or create `config.json` manually.
+
+In Dockhand or Portainer, create a new Stack and paste the following Compose configuration:
+
+```yaml
+services:
+  m3u-whats-new:
+    image: ghcr.io/slideboy/m3u-whats-new:latest
+    container_name: m3u-whats-new
+    restart: unless-stopped
+
+    ports:
+      - "${M3U_WHATS_NEW_PORT:-36401}:36401"
+
+    environment:
+      M3U_PROVIDER_URL: "${M3U_PROVIDER_URL}"
+      M3U_USERNAME: "${M3U_USERNAME}"
+      M3U_PASSWORD: "${M3U_PASSWORD}"
+      SMTP_USERNAME: "${SMTP_USERNAME:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+      TZ: "${TZ:-Europe/Paris}"
+
+    volumes:
+      - m3u-whats-new-data:/data
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:36401/', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  m3u-whats-new-data:
+    name: m3u-whats-new-data
+```
+
+### Environment variables
+
+Before deploying the Stack, define the following environment variables in Dockhand or Portainer:
 
 ```env
 M3U_PROVIDER_URL=https://your-provider.example
@@ -36,13 +79,23 @@ M3U_PASSWORD=your_password
 Optional variables:
 
 ```env
-SMTP_USERNAME=
-SMTP_PASSWORD=
 M3U_WHATS_NEW_PORT=36401
 TZ=Europe/Paris
+SMTP_USERNAME=
+SMTP_PASSWORD=
 ```
 
-Deploy the stack, then open:
+`M3U_PROVIDER_URL`, `M3U_USERNAME`, and `M3U_PASSWORD` are required.
+
+`M3U_WHATS_NEW_PORT` is optional. If omitted, the application is exposed on port `36401`.
+
+`TZ` is optional and defaults to `Europe/Paris`.
+
+`SMTP_USERNAME` and `SMTP_PASSWORD` are only required if you want to use authenticated SMTP email notifications.
+
+When using Dockhand or Portainer environment variables, **no local `.env` file is required**.
+
+Deploy the Stack, then open:
 
 ```text
 http://YOUR-SERVER-IP:36401
@@ -50,30 +103,65 @@ http://YOUR-SERVER-IP:36401
 
 If you changed `M3U_WHATS_NEW_PORT`, use that host port instead.
 
-On the first start the container automatically creates `/data/config.json` and the SQLite database in the persistent Docker volume `m3u-whats-new-data`.
+For example, with:
+
+```env
+M3U_WHATS_NEW_PORT=36402
+```
+
+open:
+
+```text
+http://YOUR-SERVER-IP:36402
+```
+
+On first start, the container automatically creates `/data/config.json` and the SQLite database in the persistent Docker volume `m3u-whats-new-data`.
 
 ## Docker Compose from the command line
 
-Clone or download the repository, then:
+If you prefer the command line, clone or download the repository.
+
+Create your local environment file:
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env`, then start:
+Edit `.env` and enter your provider credentials.
+
+Then start the application:
 
 ```bash
 docker compose up -d
+```
+
+Check the logs:
+
+```bash
 docker compose logs --tail=100
 ```
 
-Docker Compose automatically reads the local `.env` file. Never commit it.
+Docker Compose automatically reads the local `.env` file.
+
+Never commit your `.env` file.
+
+Open:
+
+```text
+http://YOUR-SERVER-IP:36401
+```
+
+or the host port configured with `M3U_WHATS_NEW_PORT`.
 
 ## First start
 
-The first scan discovers the categories exposed by your provider. No country is forced by default.
+The first scan discovers the categories exposed by your provider.
 
-Open **Settings**, enable the country/zone you want to monitor, select the VOD and series categories, then save. Existing content is first absorbed as a baseline; later additions are reported as genuine new content.
+No country or zone is enabled by default on a fresh installation.
+
+Open **Settings**, enable the country or zone you want to monitor, select the desired VOD and series categories, then save.
+
+Existing catalogue content is first absorbed as a baseline. Later additions are then reported as genuine new content instead of producing thousands of false "new" events.
 
 ## Email notifications
 
@@ -84,13 +172,13 @@ SMTP_USERNAME=your-smtp-user
 SMTP_PASSWORD=your-app-password
 ```
 
-SMTP host, port, TLS/SSL mode, sender, recipients, digest frequency and notification types are configured in the web interface.
+SMTP host, port, TLS/SSL mode, sender, recipients, digest frequency and notification types are configured from the web interface.
 
-When stack environment variables change, recreate/redeploy the container so the new values are loaded.
+When Stack environment variables change, recreate or redeploy the container so the new values are loaded.
 
 ## Persistent data
 
-The Docker image stores persistent data in `/data`, backed by the named Docker volume:
+Persistent application data is stored in `/data` inside the container and backed by the named Docker volume:
 
 ```text
 m3u-whats-new-data
@@ -98,17 +186,21 @@ m3u-whats-new-data
 
 It contains:
 
-- `config.json` — non-secret defaults, created automatically on first start.
+- `config.json` — non-secret application defaults, created automatically on first start.
 - `nouveautes.sqlite3` — active SQLite database.
 - `backups/` — application-managed SQLite backups.
 
-Deleting/recreating the container does not delete this volume. Removing the volume **does** delete the application database and backups.
+Deleting or recreating the container does **not** delete this volume.
+
+Removing the Docker volume **does** delete the application database, settings, history and backups.
 
 The historical filename `nouveautes.sqlite3` is intentionally retained for compatibility.
 
+If you prefer to keep persistent files in a visible host directory such as `/srv/m3u-whats-new`, you may replace the named volume with a bind mount in your own Compose configuration.
+
 ## Updating
 
-With a stack manager, pull the newest image and redeploy the stack.
+With Dockhand or Portainer, pull the newest image and redeploy the Stack.
 
 From the command line:
 
@@ -117,31 +209,44 @@ docker compose pull
 docker compose up -d
 ```
 
-The persistent Docker volume is retained.
+The persistent Docker volume is retained during normal container updates.
 
 ## Building locally
 
-If you want to build from source instead of using GHCR:
+If you want to build the application from source instead of using the published GHCR image:
 
 ```bash
 docker build -t m3u-whats-new:local .
 ```
 
-The official image is built from this repository by GitHub Actions for `linux/amd64` and `linux/arm64`.
+The official image is built automatically from this repository by GitHub Actions for:
+
+```text
+linux/amd64
+linux/arm64
+```
 
 ## Security
 
-The web interface currently has no built-in authentication. Do **not** expose it directly to the public Internet. Use a VPN or an authenticated reverse proxy for remote access.
+The web interface currently has no built-in authentication.
 
-Never commit `.env`, SQLite databases or backup files. See [SECURITY.md](SECURITY.md).
+Do **not** expose it directly to the public Internet. Use a VPN or an authenticated reverse proxy for remote access.
+
+Never commit `.env`, SQLite databases or backup files.
+
+See [SECURITY.md](SECURITY.md).
 
 ## Support and contributions
 
-Issues and pull requests are welcome. This is a best-effort community project: no support response time, maintenance schedule or future feature development is guaranteed.
+Issues and pull requests are welcome.
+
+This is a best-effort community project. No support response time, maintenance schedule or future feature development is guaranteed.
 
 ## Disclaimer
 
-M3U What's New is an independent project and is not affiliated with Xtream Codes, IPTV providers or M3U Editor. Use it only with services and data sources you are authorized to access.
+M3U What's New is an independent project and is not affiliated with Xtream Codes, IPTV providers or M3U Editor.
+
+Use it only with services and data sources you are authorized to access.
 
 ## License
 
