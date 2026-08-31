@@ -1,0 +1,32 @@
+name: Basic checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile Python
+        run: python -m py_compile watcher.py
+
+      - name: Validate JSON
+        run: python -m json.tool data/config.json > /dev/null
+
+      - name: Validate Docker Compose
+        run: |
+          cp .env.example .env
+          docker compose config > /dev/null
+
+      - name: Build Docker image
+        run: docker build -t m3u-whats-new:test .
