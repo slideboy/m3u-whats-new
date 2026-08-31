@@ -1,0 +1,15 @@
+services:
+  m3u-whats-new:
+    image: python:3.12-alpine
+    container_name: m3u-whats-new
+    command: ["python", "/app/watcher.py"]
+    volumes:
+      - ./watcher.py:/app/watcher.py:ro
+      - ./data:/data
+    ports:
+      - "${M3U_WHATS_NEW_PORT:-36401}:36401"
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=${TZ:-Europe/Paris}
