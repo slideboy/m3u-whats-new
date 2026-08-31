@@ -21,31 +21,41 @@ Elle ne lit ni ne proxyfie les flux : elle surveille les métadonnées du catalo
 - Interface et emails en français ou en anglais.
 - Identifiants fournisseur et SMTP conservés hors de SQLite.
 
-## Installation rapide — Dockhand / Portainer / stack Compose
+### Installation avec Dockhand / Portainer
 
-C'est la méthode recommandée. L'image Docker publiée contient déjà l'application : il n'est pas nécessaire de télécharger `watcher.py` ni de créer `config.json` à la main.
+Créez une nouvelle Stack et collez le Compose suivant :
 
-Créez une nouvelle stack et collez le [`docker-compose.yml`](docker-compose.yml) du dépôt. Dans les variables d'environnement de votre gestionnaire de stack, renseignez au minimum :
+```yaml
+services:
+  m3u-whats-new:
+    image: ghcr.io/slideboy/m3u-whats-new:latest
+    container_name: m3u-whats-new
+    restart: unless-stopped
 
-```env
-M3U_PROVIDER_URL=https://votre-fournisseur.example
-M3U_USERNAME=votre_identifiant
-M3U_PASSWORD=votre_mot_de_passe
-```
+    ports:
+      - "${M3U_WHATS_NEW_PORT:-36401}:36401"
 
-Variables facultatives :
+    environment:
+      M3U_PROVIDER_URL: "${M3U_PROVIDER_URL}"
+      M3U_USERNAME: "${M3U_USERNAME}"
+      M3U_PASSWORD: "${M3U_PASSWORD}"
+      SMTP_USERNAME: "${SMTP_USERNAME:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+      TZ: "${TZ:-Europe/Paris}"
 
-```env
-SMTP_USERNAME=
-SMTP_PASSWORD=
-M3U_WHATS_NEW_PORT=36401
-TZ=Europe/Paris
-```
+    volumes:
+      - m3u-whats-new-data:/data
 
-Déployez la stack puis ouvrez :
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:36401/', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
-```text
-http://IP-DE-VOTRE-SERVEUR:36401
+volumes:
+  m3u-whats-new-data:
+    name: m3u-whats-new-data
 ```
 
 Si vous avez modifié `M3U_WHATS_NEW_PORT`, utilisez ce port côté hôte.
