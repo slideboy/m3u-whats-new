@@ -29,6 +29,7 @@ EMAIL_CHECK_SECONDS = 15
 EMAIL_RETRY_MINUTES = 10
 
 APP_NAME = "M3U What's New"
+APP_VERSION = "1.0.2"
 APP_USER_AGENT = "Mozilla/5.0 M3U-Whats-New/1.0"
 
 def utc_now():
@@ -200,11 +201,6 @@ def load_config():
     cfg.setdefault("request_timeout_seconds", 25)
     cfg.setdefault("port", 36401)
     cfg.setdefault("timezone", "Europe/Paris")
-    # En déploiement par stack, TZ permet de régler le fuseau sans devoir
-    # modifier le fichier config.json stocké dans le volume Docker.
-    runtime_timezone = env_text("TZ", cfg.get("timezone", "Europe/Paris")).strip()
-    if runtime_timezone:
-        cfg["timezone"] = runtime_timezone
     cfg.setdefault("user_agent", APP_USER_AGENT)
 
     cfg["provider_url"] = cfg["provider_url"].rstrip("/")
@@ -964,10 +960,10 @@ def smtp_send(settings, subject, body):
     msg["From"] = sender
     msg["To"] = ", ".join(recipients)
 
-    # Version texte conservée pour compatibilité.
+    # Toujours conserver une version texte.
     msg.set_content(safe_text(body))
 
-    # Version HTML.
+    # Version HTML pour les clients compatibles.
     msg.add_alternative(
         _email_html_from_text(subject, body, settings.get("language", "fr")),
         subtype="html",
@@ -982,11 +978,14 @@ def smtp_send(settings, subject, body):
 
     with client:
         client.ehlo()
+
         if security == "starttls":
             client.starttls(context=context)
             client.ehlo()
+
         if username:
             client.login(username, password)
+
         client.send_message(msg)
 
 
@@ -1605,6 +1604,28 @@ def get_backup_status(lang=None):
     except Exception:
         files = []
 
+    def human_size(size_bytes):
+        try:
+            size = float(max(0, int(size_bytes)))
+        except Exception:
+            size = 0.0
+        units = (
+            ("o", "Ko", "Mo", "Go", "To")
+            if lang == "fr"
+            else ("B", "KB", "MB", "GB", "TB")
+        )
+        index = 0
+        while size >= 1024 and index < len(units) - 1:
+            size /= 1024.0
+            index += 1
+        if index == 0:
+            value = str(int(size))
+        else:
+            value = f"{size:.1f}".rstrip("0").rstrip(".")
+            if lang == "fr":
+                value = value.replace(".", ",")
+        return f"{value} {units[index]}"
+
     if not files:
         return {
             "label": ui_text(lang, "Aucune sauvegarde", "No backup"),
@@ -1613,9 +1634,23 @@ def get_backup_status(lang=None):
             "detail": ui_text(lang, "Aucun fichier trouvé", "No file found"),
             "count": 0,
             "latest_iso": "",
+            "latest_size": "—",
+            "total_size": human_size(0),
         }
 
     latest = files[0]
+
+    try:
+        latest_size_bytes = latest.stat().st_size
+    except Exception:
+        latest_size_bytes = 0
+
+    total_size_bytes = 0
+    for backup_file in files:
+        try:
+            total_size_bytes += backup_file.stat().st_size
+        except Exception:
+            pass
     try:
         mtime = datetime.fromtimestamp(latest.stat().st_mtime, tz=timezone.utc).astimezone(TZ)
         age_hours = (datetime.now(TZ) - mtime).total_seconds() / 3600
@@ -1646,6 +1681,8 @@ def get_backup_status(lang=None):
         "detail": detail,
         "count": len(files),
         "latest_iso": latest_iso,
+        "latest_size": human_size(latest_size_bytes),
+        "total_size": human_size(total_size_bytes),
     }
 
 def backup_is_due(settings, now_local=None):
@@ -2953,11 +2990,12 @@ def render_page(days):
             for index, code in enumerate(ordered):
                 active = " active" if index == 0 else ""
                 enabled = country_enabled.get(code, False)
+                monitored = " monitored" if enabled else ""
                 checked = " checked" if enabled else ""
                 label = country_label(code, lang)
                 total = len(by_country[code]["vod"]) + len(by_country[code]["series"])
                 tabs_parts.append(
-                    f'<button type="button" class="country-tab{active}" data-country="{html.escape(code, quote=True)}">'
+                    f'<button type="button" class="country-tab{active}{monitored}" data-country="{html.escape(code, quote=True)}">'
                     f'{html.escape(label)} <span>{total}</span></button>'
                 )
 
@@ -3011,7 +3049,11 @@ def render_page(days):
       <input type="hidden" name="return_days" value="{days}">
       <div class="settings-tools">
         <input id="categorySearch" class="settings-search" type="search" placeholder="{L("Rechercher une catégorie…", "Search a category…")}" autocomplete="off">
-        <div class="settings-hint">{L("Coche un pays puis les catégories VOD/Séries à surveiller. « Recréer la référence » efface les nouveautés déjà mémorisées pour les catégories surveillées de cette zone et prend le catalogue courant comme nouvelle base au prochain scan.", "Select a country, then the VOD/Series categories to monitor. ‘Rebuild baseline’ clears the remembered changes for the monitored categories in that zone and uses the current catalogue as the new baseline on the next scan.")}</div>
+        <div class="settings-hint">{L("Coche un pays puis les catégories VOD/Séries à surveiller.", "Select a country, then the VOD/Series categories to monitor.")}</div>
+        <div class="baseline-warning">⚠️ {L(
+            "Attention : « Recréer la référence » efface les nouveautés déjà mémorisées pour les catégories surveillées de cette zone. Au prochain scan, le catalogue courant deviendra la nouvelle référence.",
+            "Warning: ‘Rebuild baseline’ clears the remembered changes for the monitored categories in this zone. On the next scan, the current catalogue will become the new baseline."
+        )}</div>
       </div>
       <div class="settings-layout">
         <aside class="country-tabs">{tabs}</aside>
@@ -3080,8 +3122,10 @@ def render_page(days):
           </label>
         </div>
         <div class="backup-info" id="backupSettingsInfo">
-          {L("Dernière sauvegarde", "Latest backup")} : <strong id="backupSettingsDetail">{html.escape(backup["detail"])}</strong> ·
-          <span id="backupSettingsCount">{html.escape(str(backup["count"]))}</span> {L("fichier(s) conservé(s).", "file(s) kept.")}
+          {L("Dernière sauvegarde", "Latest backup")} : <strong class="system-value" id="backupSettingsDetail">{html.escape(backup["detail"])}</strong> ·
+          {L("Taille", "Size")} : <strong class="system-value" id="backupSettingsLatestSize">{html.escape(backup["latest_size"])}</strong> ·
+          <span class="system-value" id="backupSettingsCount">{html.escape(str(backup["count"]))}</span> {L("fichier(s) conservé(s)", "file(s) kept")} ·
+          {L("Total", "Total")} : <strong class="system-value" id="backupSettingsTotalSize">{html.escape(backup["total_size"])}</strong>.
           {L("La sauvegarde utilise la fonction native SQLite, compatible avec le mode WAL.", "Backups use SQLite’s native backup function and are compatible with WAL mode.")}
         </div>
       </section>
@@ -3100,7 +3144,7 @@ def render_page(days):
           </label>
           <label>
             <span>{L("Fréquence d’envoi", "Send frequency")}</span>
-            <select name="email_digest_hours">
+            <select name="email_digest_hours" id="emailDigestHours" data-saved-value="{email_settings["digest_hours"]}">
               <option value="0"{" selected" if email_settings["digest_hours"] == 0 else ""}>{L("Immédiatement", "Immediately")}</option>
               <option value="1"{" selected" if email_settings["digest_hours"] == 1 else ""}>{L("Toutes les heures", "Every hour")}</option>
               <option value="2"{" selected" if email_settings["digest_hours"] == 2 else ""}>{L("Toutes les 2 heures", "Every 2 hours")}</option>
@@ -3371,7 +3415,11 @@ def render_page(days):
         for key, singular, plural in labels:
             n = int(counts.get(key, 0) or 0)
             if n:
-                parts.append(f"{n} {singular if n == 1 else plural}")
+                label = singular if n == 1 else plural
+                parts.append(
+                    f'<span class="day-breakdown-number">{n}</span> '
+                    f'{html.escape(label)}'
+                )
         return " · ".join(parts)
 
     def history_by_day():
@@ -3408,7 +3456,7 @@ def render_page(days):
                 f'<span class="day-label">{html.escape(group["label"])}</span>'
                 f'<span class="day-summary">'
                 f'<span class="day-count">{total} {total_word}</span>'
-                f'<span class="day-breakdown">{html.escape(breakdown)}</span>'
+                f'<span class="day-breakdown">{breakdown}</span>'
                 f'</span>'
                 f'</summary>'
                 f'<div class="day-body">{"".join(group["items"])}</div>'
@@ -3417,6 +3465,10 @@ def render_page(days):
         return "".join(out)
 
     def section(section_id, title, emoji, kinds, section_count, open_when_nonempty=False):
+        # Ne pas afficher les sections sans nouveauté.
+        if not section_count:
+            return ""
+
         open_attr = ""
         return (
             f'<details class="section" id="{section_id}"{open_attr}>'
@@ -3564,6 +3616,58 @@ h1 {{
     margin: 4px 0 6px;
     font-size: clamp(25px, 5vw, 36px);
     letter-spacing: -.035em;
+}}
+.version-badge {{
+    display: inline-flex;
+    vertical-align: middle;
+    margin-left: 8px;
+    padding: 3px 7px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: .02em;
+}}
+.toast-stack {{
+    position:fixed;
+    top:18px;
+    right:18px;
+    z-index:20000;
+    display:flex;
+    flex-direction:column;
+    gap:9px;
+    width:min(380px, calc(100vw - 36px));
+    pointer-events:none;
+}}
+.toast {{
+    padding:12px 14px;
+    border-radius:11px;
+    border:1px solid var(--line);
+    background:#151d29;
+    color:#f4f7fb;
+    box-shadow:0 12px 35px rgba(0,0,0,.35);
+    font-size:13px;
+    font-weight:700;
+    line-height:1.4;
+    opacity:0;
+    transform:translateY(-8px);
+    transition:opacity .18s ease, transform .18s ease;
+}}
+.toast.show {{
+    opacity:1;
+    transform:translateY(0);
+}}
+.toast.success {{
+    border-color:#39765f;
+    background:#173429;
+    color:#b9efd9;
+}}
+.toast.error {{
+    border-color:#87404a;
+    background:#351a20;
+    color:#ffc3ca;
 }}
 .hero-sub {{
     color: var(--muted);
@@ -3840,8 +3944,12 @@ h1 {{
 }}
 .day-breakdown {{
     color: var(--muted);
-    font-size: 11px;
+    font-size: 12px;
     white-space: nowrap;
+}}
+.day-breakdown-number {{
+    color:#fff;
+    font-weight:800;
 }}
 .day-body {{
     border-top: 1px solid rgba(255,255,255,.055);
@@ -3925,6 +4033,10 @@ h1 {{
     grid-template-columns: 1.2fr .8fr;
     gap: 10px;
 }}
+.system-value {{
+    color:#fff;
+    font-weight:700;
+}}
 .system-card {{
     background: var(--panel);
     border: 1px solid var(--line);
@@ -4003,8 +4115,19 @@ code {{
 
 
 /* --- Paramètres Pays / Catégories --- */
-.settings-btn {{ border:1px solid #2b3950; background:#182235; color:#e9eef7; border-radius:10px; padding:10px 13px; cursor:pointer; font-weight:700; }}
-.settings-btn:hover {{ background:#22304a; }}
+.settings-btn, .refresh-btn {{
+    border:1px solid #2b3950;
+    background:#182235;
+    color:#e9eef7;
+    border-radius:10px;
+    padding:10px 13px;
+    cursor:pointer;
+    font-weight:700;
+    font-size:13px;
+}}
+.settings-btn:hover, .refresh-btn:hover {{
+    background:#22304a;
+}}
 .modal {{ position:fixed; inset:0; background:rgba(4,8,15,.78); display:none; align-items:center; justify-content:center; padding:20px; z-index:9999; }}
 .modal.open {{ display:flex; }}
 .modal-card {{ width:min(1120px,96vw); max-height:92vh; overflow:hidden; background:#0f1724; border:1px solid #2b3950; border-radius:18px; box-shadow:0 24px 80px rgba(0,0,0,.45); display:flex; flex-direction:column; }}
@@ -4015,11 +4138,36 @@ code {{
 .settings-tools {{ padding:14px 20px; border-bottom:1px solid #27344a; }}
 .settings-search {{ width:100%; padding:11px 12px; border-radius:10px; border:1px solid #34445e; background:#111b2b; color:#fff; }}
 .settings-hint {{ color:#8fa2bd; font-size:12px; margin-top:8px; }}
+.baseline-warning {{
+    margin-top:9px;
+    padding:9px 11px;
+    border:1px solid #7d3b45;
+    border-radius:9px;
+    background:#2a171b;
+    color:#ff9da8;
+    font-size:12px;
+    font-weight:700;
+    line-height:1.45;
+}}
 .settings-layout {{ display:grid; grid-template-columns:220px 1fr; min-height:460px; overflow:hidden; flex:0 0 auto; }}
 .country-tabs {{ padding:10px; border-right:1px solid #27344a; overflow:auto; background:#0c1420; }}
 .country-tab {{ width:100%; display:flex; justify-content:space-between; gap:8px; border:0; background:transparent; color:#aebbd0; padding:10px 11px; border-radius:9px; cursor:pointer; text-align:left; }}
 .country-tab span {{ opacity:.6; }}
 .country-tab.active {{ background:#1d2b43; color:#fff; }}
+.country-tab.monitored {{
+    background:#132a22;
+    color:#a8e8cf;
+    box-shadow:inset 0 0 0 1px #39765f;
+}}
+.country-tab.monitored span {{
+    color:#a8e8cf;
+    opacity:.9;
+}}
+.country-tab.monitored.active {{
+    background:#1b3b2f;
+    color:#d8f7e9;
+    box-shadow:inset 0 0 0 1px #4c9b7a;
+}}
 .country-content {{ overflow:auto; padding:16px 18px 22px; }}
 .country-panel {{ display:none; }}
 .country-panel.active {{ display:block; }}
@@ -4096,13 +4244,14 @@ code {{
 </style>
 </head>
 <body>
+<div id="toastStack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
 <div class="wrap">
 
 <header class="hero">
     <div class="hero-top">
         <div>
             <div class="eyebrow">Monitoring Xtream · <span id="monitorCountryDisplay">{html.escape(country_display)}</span></div>
-            <h1>📡 {html.escape(APP_NAME)}</h1>
+            <h1>📡 {html.escape(APP_NAME)} <span class="version-badge">v{html.escape(APP_VERSION)}</span></h1>
             <div class="hero-sub">{total_changes} {L("changement(s) sur la période sélectionnée", "change(s) in the selected period")}</div>
         </div>
         <div class="hero-actions">
@@ -4171,7 +4320,14 @@ code {{
 
         <div class="toolbar-actions">
             <button class="settings-btn" id="openSettings">⚙️ {L("Paramètres", "Settings")}</button>
-            <button class="refresh-btn" onclick="location.reload()">↻ {L("Actualiser", "Refresh")}</button>
+            <button class="refresh-btn" onclick="location.reload()">
+                <svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;">
+                    <path d="M20 6v5h-5"/>
+                    <path d="M4 18v-5h5"/>
+                    <path d="M6.1 9a7 7 0 0 1 11.5-2.6L20 11"/>
+                    <path d="M17.9 15a7 7 0 0 1-11.5 2.6L4 13"/>
+                </svg>{L("Actualiser", "Refresh")}
+            </button>
         </div>
     </div>
 
@@ -4205,21 +4361,23 @@ code {{
 <section class="system">
     <div class="system-card">
         <b>{L("Catalogue suivi", "Monitored catalogue")}</b><br>
-        {html.escape(meta.get("movie_count","—"))} {L("films", "movies")} ·
-        {html.escape(meta.get("series_count","—"))} {L("séries", "series")}<br>
-        {L("Pays", "Countries")} : <span id="catalogCountryDisplay">{html.escape(country_display)}</span><br>
-        <span id="catalogVodCategoryCount">{enabled_vod_category_count}</span> {L("catégories Films", "Movie categories")} ·
-        <span id="catalogSeriesCategoryCount">{enabled_series_category_count}</span> {L("catégories Séries", "Series categories")}
+        <span class="system-value">{html.escape(meta.get("movie_count","—"))}</span> {L("films", "movies")} ·
+        <span class="system-value">{html.escape(meta.get("series_count","—"))}</span> {L("séries", "series")}<br>
+        {L("Pays", "Countries")} : <span class="system-value" id="catalogCountryDisplay">{html.escape(country_display)}</span><br>
+        <span class="system-value" id="catalogVodCategoryCount">{enabled_vod_category_count}</span> {L("catégories Films", "Movie categories")} ·
+        <span class="system-value" id="catalogSeriesCategoryCount">{enabled_series_category_count}</span> {L("catégories Séries", "Series categories")}
     </div>
     <div class="system-card">
         <b>{L("Système", "System")}</b><br>
-        {L("Intervalle", "Interval")} : <span id="scanSystemInterval">{html.escape(interval)}</span> min ·
-        {L("Rétention", "Retention")} : {html.escape(retention)} {L("j", "d")}<br>
+        {L("Intervalle", "Interval")} : <span class="system-value" id="scanSystemInterval">{html.escape(interval)}</span> min ·
+        {L("Rétention", "Retention")} : <span class="system-value">{html.escape(retention)}</span> {L("j", "d")}<br>
         {L("Suppression confirmée après", "Removal confirmed after")} {html.escape(confirm_scans)} scans ·
-        {L("Notifications", "Notifications")} : <span id="notificationSystemStatus">{notif_status}</span><br>
-        {L("Sauvegardes conservées", "Backups kept")} : <span id="backupSystemCount">{html.escape(str(backup["count"]))}</span> ·
-        {L("Dernière", "Latest")} : <span id="backupSystemDetail">{html.escape(backup["detail"])}</span><br>
-        {L("Séries en attente", "Series pending")} : {pending}
+        {L("Notifications", "Notifications")} : <span class="system-value" id="notificationSystemStatus">{notif_status}</span><br>
+        {L("Sauvegardes conservées", "Backups kept")} : <span class="system-value" id="backupSystemCount">{html.escape(str(backup["count"]))}</span> ·
+        {L("Total", "Total")} : <span class="system-value" id="backupSystemTotalSize">{html.escape(backup["total_size"])}</span><br>
+        {L("Dernière", "Latest")} : <span class="system-value" id="backupSystemDetail">{html.escape(backup["detail"])}</span> ·
+        <span class="system-value" id="backupSystemLatestSize">{html.escape(backup["latest_size"])}</span><br>
+        {L("Séries en attente", "Series pending")} : <span class="system-value">{pending}</span>
     </div>
 </section>
 
@@ -4257,6 +4415,7 @@ const TXT = {{
     disabled: {json.dumps(L('Désactivées', 'Disabled'), ensure_ascii=False)},
     scanRunning: {json.dumps(L('Scan en cours…', 'Scan running…'), ensure_ascii=False)},
     scanNow: {json.dumps(L('Scanner maintenant', 'Scan now'), ensure_ascii=False)},
+    scanStarted: {json.dumps(L('Scan lancé ✓', 'Scan started ✓'), ensure_ascii=False)},
     launching: {json.dumps(L('Lancement…', 'Starting…'), ensure_ascii=False)},
     invalidMin: {json.dumps(L('Valeur invalide. Minimum : 5 minutes.', 'Invalid value. Minimum: 5 minutes.'), ensure_ascii=False)},
     min5: {json.dumps(L('Minimum : 5 minutes.', 'Minimum: 5 minutes.'), ensure_ascii=False)},
@@ -4279,10 +4438,32 @@ const TXT = {{
     saveFailed: {json.dumps(L('Échec de l’enregistrement', 'Save failed'), ensure_ascii=False)},
     saved: {json.dumps(L('Enregistré ✓', 'Saved ✓'), ensure_ascii=False)},
     saveImpossible: {json.dumps(L('Enregistrement impossible', 'Unable to save'), ensure_ascii=False)},
+    immediateWarning: {json.dumps(L(
+        'Attention : les notifications en attente seront envoyées immédiatement après l’enregistrement. Continuer ?',
+        'Warning: pending notifications will be sent immediately after saving. Continue?'
+    ), ensure_ascii=False)},
     rebuildTitle: {json.dumps(L('Recréer la référence pour', 'Rebuild baseline for'), ensure_ascii=False)},
     rebuildBody1: {json.dumps(L('Les nouveautés actuellement mémorisées pour les catégories surveillées de cette zone seront nettoyées.', 'The changes currently remembered for the monitored categories in this zone will be cleared.'), ensure_ascii=False)},
     rebuildBody2: {json.dumps(L('Au prochain scan, le catalogue présent deviendra la nouvelle référence.', 'On the next scan, the current catalogue will become the new baseline.'), ensure_ascii=False)}
 }};
+
+const toastStack = document.getElementById('toastStack');
+
+function showToast(message, type = 'success') {{
+    if (!toastStack || !message) return;
+
+    const toast = document.createElement('div');
+    toast.className = 'toast ' + type;
+    toast.textContent = message;
+    toastStack.appendChild(toast);
+
+    requestAnimationFrame(() => toast.classList.add('show'));
+
+    setTimeout(() => {{
+        toast.classList.remove('show');
+        setTimeout(() => toast.remove(), 220);
+    }}, type === 'error' ? 5000 : 3000);
+}}
 
 const sectionFilterMap = {{
     films: 'film',
@@ -4359,10 +4540,22 @@ function applyFilters() {{
                 ['suppression', TXT.removal, TXT.removals],
                 ['renommage', TXT.rename, TXT.renames]
             ];
-            breakdown.textContent = labels
-                .filter(([key]) => counts[key])
-                .map(([key, one, many]) => `${{counts[key]}} ${{counts[key] === 1 ? one : many}}`)
-                .join(' · ');
+            breakdown.replaceChildren();
+            const parts = labels.filter(([key]) => counts[key]);
+
+            parts.forEach(([key, one, many], index) => {{
+                if (index > 0) {{
+                    breakdown.appendChild(document.createTextNode(' · '));
+                }}
+
+                const number = document.createElement('span');
+                number.className = 'day-breakdown-number';
+                number.textContent = String(counts[key]);
+                breakdown.appendChild(number);
+                breakdown.appendChild(
+                    document.createTextNode(` ${{counts[key] === 1 ? one : many}}`)
+                );
+            }});
         }}
 
         group.style.display = visibleCount > 0 ? '' : 'none';
@@ -4480,6 +4673,20 @@ if (settingsModal) settingsModal.addEventListener('click', (e) => {{
 }});
 
 schedulePageRefresh();
+
+document.querySelectorAll('input[name="countries"]').forEach(checkbox => {{
+    checkbox.addEventListener('change', () => {{
+        const panel = checkbox.closest('.country-panel');
+        if (!panel) return;
+
+        const code = panel.dataset.countryPanel;
+        const tab = document.querySelector(
+            `.country-tab[data-country="${{CSS.escape(code)}}"]`
+        );
+
+        if (tab) tab.classList.toggle('monitored', checkbox.checked);
+    }});
+}});
 
 document.querySelectorAll('.country-tab').forEach(btn => {{
     btn.addEventListener('click', () => {{
@@ -4612,8 +4819,9 @@ if (runScanNow) runScanNow.addEventListener('click', async () => {{
             throw new Error(result.error || TXT.scanStartFailed);
         }}
         applyScanStatus(result.status);
+        showToast(TXT.scanStarted, 'success');
     }} catch (err) {{
-        alert(`${{TXT.scanFailed}}: ${{err.message || err}}`);
+        showToast(`${{TXT.scanFailed}}: ${{err.message || err}}`, 'error');
         runScanNow.disabled = false;
         runScanNow.textContent = TXT.scanNow;
     }}
@@ -4627,15 +4835,23 @@ function applyBackupStatus(status) {{
 
     const settingsDetail = document.getElementById('backupSettingsDetail');
     const settingsCount = document.getElementById('backupSettingsCount');
+    const settingsLatestSize = document.getElementById('backupSettingsLatestSize');
+    const settingsTotalSize = document.getElementById('backupSettingsTotalSize');
     const systemDetail = document.getElementById('backupSystemDetail');
     const systemCount = document.getElementById('backupSystemCount');
+    const systemLatestSize = document.getElementById('backupSystemLatestSize');
+    const systemTotalSize = document.getElementById('backupSystemTotalSize');
     const pill = document.getElementById('backupStatusPill');
     const pillText = document.getElementById('backupStatusText');
 
     if (settingsDetail) settingsDetail.textContent = detail;
     if (settingsCount) settingsCount.textContent = count;
+    if (settingsLatestSize) settingsLatestSize.textContent = status.latest_size || '—';
+    if (settingsTotalSize) settingsTotalSize.textContent = status.total_size || '—';
     if (systemDetail) systemDetail.textContent = detail;
     if (systemCount) systemCount.textContent = count;
+    if (systemLatestSize) systemLatestSize.textContent = status.latest_size || '—';
+    if (systemTotalSize) systemTotalSize.textContent = status.total_size || '—';
     if (pillText) pillText.textContent = `${{label}} · ${{detail}}`;
     if (pill) {{
         pill.classList.remove('ok', 'warn', 'error');
@@ -4673,12 +4889,13 @@ if (runBackupNow) runBackupNow.addEventListener('click', async () => {{
         }}
         applyBackupStatus(result.status);
         runBackupNow.textContent = TXT.backupDone;
+        showToast(TXT.backupDone, 'success');
         setTimeout(() => {{
             runBackupNow.textContent = originalText;
             runBackupNow.disabled = false;
         }}, 1600);
     }} catch (err) {{
-        alert(`${{TXT.backupImpossible}}: ${{err.message || err}}`);
+        showToast(`${{TXT.backupImpossible}}: ${{err.message || err}}`, 'error');
         runBackupNow.textContent = originalText;
         runBackupNow.disabled = false;
     }}
@@ -4703,12 +4920,13 @@ if (testEmailBtn) testEmailBtn.addEventListener('click', async () => {{
             throw new Error(result.error || TXT.emailSendFailed);
         }}
         testEmailBtn.textContent = TXT.emailSent;
+        showToast(TXT.emailSent, 'success');
         setTimeout(() => {{
             testEmailBtn.textContent = originalText;
             testEmailBtn.disabled = false;
         }}, 1800);
     }} catch (err) {{
-        alert(`${{TXT.emailTestImpossible}}: ${{err.message || err}}`);
+        showToast(`${{TXT.emailTestImpossible}}: ${{err.message || err}}`, 'error');
         testEmailBtn.textContent = originalText;
         testEmailBtn.disabled = false;
     }}
@@ -4716,6 +4934,17 @@ if (testEmailBtn) testEmailBtn.addEventListener('click', async () => {{
 
 if (settingsForm) settingsForm.addEventListener('submit', async (e) => {{
     e.preventDefault();
+
+    const digestSelect = settingsForm.querySelector('#emailDigestHours');
+    if (
+        digestSelect &&
+        digestSelect.value === '0' &&
+        digestSelect.dataset.savedValue !== '0'
+    ) {{
+        const ok = confirm(TXT.immediateWarning);
+        if (!ok) return;
+    }}
+
     const submitBtn = settingsForm.querySelector('.save-btn');
     const originalText = submitBtn ? submitBtn.textContent : TXT.save;
     if (submitBtn) {{
@@ -4744,8 +4973,10 @@ if (settingsForm) settingsForm.addEventListener('submit', async (e) => {{
         applySettingsSummary(result.summary);
         applyBackupStatus(result.status);
         applyScanStatus(result.scan_status);
+        if (digestSelect) digestSelect.dataset.savedValue = digestSelect.value;
         if (submitBtn) {{
             submitBtn.textContent = TXT.saved;
+            showToast(TXT.saved, 'success');
             setTimeout(() => {{
                 submitBtn.textContent = originalText;
                 submitBtn.disabled = false;
@@ -4753,7 +4984,7 @@ if (settingsForm) settingsForm.addEventListener('submit', async (e) => {{
         }}
         // Important : la fenêtre Paramètres reste ouverte. Aucun reload complet.
     }} catch (err) {{
-        alert(`${{TXT.saveImpossible}}: ${{err.message || err}}`);
+        showToast(`${{TXT.saveImpossible}}: ${{err.message || err}}`, 'error');
         if (submitBtn) {{
             submitBtn.textContent = originalText;
             submitBtn.disabled = false;
