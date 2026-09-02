@@ -698,6 +698,259 @@ def validate_email_settings(settings):
     return sender, recipients
 
 
+def _email_html_from_text(subject, body, lang="fr"):
+    """Construit le rendu HTML d'un email à partir de son contenu texte."""
+    lang = normalize_ui_language(lang)
+    raw_body = safe_text(body)
+    automatic_label = ui_text(lang, "Notification automatique", "Automated notification")
+    country_heading = ui_text(lang, "Par pays / zone", "By country / zone")
+    lines = raw_body.splitlines()
+    digest_mode = any(
+        "récapitulatif des nouveautés" in safe_text(line).lower()
+        or "what's new digest" in safe_text(line).lower()
+        for line in lines[:6]
+    )
+
+    safe_subject = html.escape(safe_text(subject))
+    safe_app = html.escape(APP_NAME)
+
+    if not digest_mode:
+        safe_body = html.escape(raw_body)
+        return f"""<!doctype html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#0b1220;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#0b1220;padding:24px 10px;">
+<tr><td align="center">
+<table role="presentation" width="640" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:640px;background:#ffffff;border-radius:16px;overflow:hidden;">
+<tr><td style="background:#111827;padding:26px 28px;font-family:Arial,sans-serif;">
+<div style="font-size:22px;font-weight:800;color:#ffffff;">📡 {safe_app}</div>
+<div style="font-size:13px;color:#cbd5e1;margin-top:7px;">{safe_subject}</div>
+</td></tr>
+<tr><td style="padding:26px 28px;font-family:Arial,sans-serif;font-size:14px;line-height:1.65;color:#1f2937;white-space:pre-wrap;">{safe_body}</td></tr>
+<tr><td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:14px 28px;font-family:Arial,sans-serif;font-size:11px;color:#64748b;">
+{safe_app} · {html.escape(automatic_label)}
+</td></tr>
+</table>
+</td></tr></table>
+</body></html>"""
+
+    labels = {
+        "films": ("🎬", "Films"),
+        "movies": ("🎬", "Movies"),
+        "séries": ("📺", "Séries"),
+        "series": ("📺", "Series"),
+        "épisodes": ("▶️", "Épisodes"),
+        "episodes": ("▶️", "Episodes"),
+        "catégories": ("📂", "Catégories"),
+        "categories": ("📂", "Categories"),
+    }
+
+    section_icons = {
+        "FILMS": "🎬",
+        "MOVIES": "🎬",
+        "SÉRIES": "📺",
+        "SERIES": "📺",
+        "ÉPISODES": "▶️",
+        "EPISODES": "▶️",
+        "CATÉGORIES": "📂",
+        "CATEGORIES": "📂",
+    }
+
+    stats = []
+    period = ""
+    preview = ""
+    countries = []
+    sections = []
+    current_section = None
+    latest_scan = ""
+    notes = []
+
+    for raw in lines:
+        line = safe_text(raw).strip()
+        if not line:
+            continue
+
+        lower = line.lower()
+        upper = line.upper()
+
+        if APP_NAME.lower() in lower and (
+            "récapitulatif des nouveautés" in lower or "what's new digest" in lower
+        ):
+            continue
+
+        if lower.startswith("aperçu") or lower.startswith("preview"):
+            preview = line
+            continue
+
+        if lower.startswith("période") or lower.startswith("period"):
+            period = line
+            continue
+
+        stat_match = re.match(
+            r"^(films|movies|séries|series|épisodes|episodes|catégories|categories)\s*:\s*(\d+)\s*$",
+            line,
+            re.IGNORECASE,
+        )
+        if stat_match:
+            key = stat_match.group(1).lower()
+            icon, label = labels[key]
+            stats.append((icon, label, stat_match.group(2)))
+            continue
+
+        if lower.startswith("par pays") or lower.startswith("by country"):
+            current_section = "__countries__"
+            continue
+
+        if upper in section_icons:
+            current_section = upper
+            sections.append([upper, []])
+            continue
+
+        if lower.startswith("dernier scan") or lower.startswith("latest scan"):
+            latest_scan = line
+            continue
+
+        if line.startswith("• "):
+            item = line[2:].strip()
+            if current_section == "__countries__":
+                countries.append(item)
+            elif current_section and sections:
+                sections[-1][1].append(item)
+            continue
+
+        if line.startswith("…") or line.startswith("..."):
+            notes.append(line)
+
+    stat_bg = ("#eff6ff", "#f5f3ff", "#ecfdf5", "#fff7ed")
+    stat_fg = ("#1d4ed8", "#6d28d9", "#047857", "#c2410c")
+
+    stat_cells = []
+    for idx, (icon, label, value) in enumerate(stats[:4]):
+        stat_cells.append(
+            f'<td width="25%" valign="top" style="padding:4px;">'
+            f'<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">'
+            f'<tr><td align="center" style="background:{stat_bg[idx]};border-radius:12px;padding:14px 6px;">'
+            f'<div style="font-size:25px;font-weight:800;color:{stat_fg[idx]};line-height:1;">{html.escape(value)}</div>'
+            f'<div style="font-size:11px;color:#475569;margin-top:7px;">{icon} {html.escape(label)}</div>'
+            f'</td></tr></table></td>'
+        )
+
+    stats_html = ""
+    if stat_cells:
+        stats_html = (
+            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin:14px 0 20px;">'
+            '<tr>' + "".join(stat_cells) + '</tr></table>'
+        )
+
+    preview_html = ""
+    if preview:
+        preview_html = (
+            '<div style="display:inline-block;background:#fef3c7;color:#92400e;'
+            'border-radius:999px;padding:6px 10px;font-size:11px;font-weight:700;margin-bottom:12px;">'
+            + html.escape(preview) + '</div>'
+        )
+
+    period_html = ""
+    if period:
+        period_html = (
+            '<div style="font-size:13px;color:#64748b;margin-bottom:4px;">'
+            + html.escape(period) + '</div>'
+        )
+
+    countries_html = ""
+    if countries:
+        chips = "".join(
+            '<span style="display:inline-block;background:#eef2ff;color:#374151;'
+            'border-radius:999px;padding:7px 10px;margin:0 6px 7px 0;font-size:12px;">'
+            + html.escape(item) + '</span>'
+            for item in countries
+        )
+        countries_html = (
+            '<div style="margin-top:22px;">'
+            f'<div style="font-size:16px;font-weight:800;color:#111827;margin-bottom:10px;">🌍 {html.escape(country_heading)}</div>'
+            + chips + '</div>'
+        )
+
+    sections_html_parts = []
+
+    for name, items in sections:
+        if not items:
+            continue
+
+        icon = section_icons.get(name, "•")
+        title = name.title()
+
+        rows = "".join(
+            '<tr><td style="padding:10px 0;border-bottom:1px solid #e5e7eb;'
+            'font-size:14px;line-height:1.45;color:#1f2937;">'
+            + html.escape(item) + '</td></tr>'
+            for item in items
+        )
+
+        sections_html_parts.append(
+            '<div style="margin-top:24px;">'
+            f'<div style="font-size:17px;font-weight:800;color:#111827;margin-bottom:6px;">{icon} {html.escape(title)}</div>'
+            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">'
+            + rows + '</table></div>'
+        )
+
+    sections_html = "".join(sections_html_parts)
+
+    notes_html = "".join(
+        '<div style="margin-top:14px;padding:10px 12px;background:#f8fafc;border-radius:10px;'
+        'font-size:12px;color:#64748b;">' + html.escape(note) + '</div>'
+        for note in notes
+    )
+
+    latest_html = (
+        html.escape(latest_scan)
+        if latest_scan
+        else datetime.now(TZ).strftime("%d/%m/%Y %H:%M")
+    )
+
+    return f"""<!doctype html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#0b1220;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#0b1220;padding:24px 10px;">
+<tr><td align="center">
+
+<table role="presentation" width="640" cellspacing="0" cellpadding="0" border="0"
+style="width:100%;max-width:640px;background:#ffffff;border-radius:16px;overflow:hidden;">
+
+<tr>
+<td style="background:#111827;padding:26px 28px;font-family:Arial,sans-serif;">
+<div style="font-size:22px;font-weight:800;color:#ffffff;">📡 {safe_app}</div>
+<div style="font-size:13px;color:#cbd5e1;margin-top:7px;">{safe_subject}</div>
+</td>
+</tr>
+
+<tr>
+<td style="padding:24px 28px 30px;font-family:Arial,sans-serif;">
+{preview_html}
+{period_html}
+{stats_html}
+{countries_html}
+{sections_html}
+{notes_html}
+</td>
+</tr>
+
+<tr>
+<td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:14px 28px;
+font-family:Arial,sans-serif;font-size:11px;line-height:1.5;color:#64748b;">
+{latest_html}<br>
+{safe_app} · {html.escape(automatic_label)}
+</td>
+</tr>
+
+</table>
+</td></tr></table>
+</body>
+</html>"""
+
+
 def smtp_send(settings, subject, body):
     sender, recipients = validate_email_settings(settings)
     host = safe_text(settings.get("smtp_host")).strip()
@@ -710,9 +963,18 @@ def smtp_send(settings, subject, body):
     msg["Subject"] = safe_text(subject)
     msg["From"] = sender
     msg["To"] = ", ".join(recipients)
+
+    # Version texte conservée pour compatibilité.
     msg.set_content(safe_text(body))
 
+    # Version HTML.
+    msg.add_alternative(
+        _email_html_from_text(subject, body, settings.get("language", "fr")),
+        subtype="html",
+    )
+
     context = ssl.create_default_context()
+
     if security == "ssl":
         client = smtplib.SMTP_SSL(host, port, timeout=20, context=context)
     else:
@@ -3854,10 +4116,25 @@ code {{
             </div>
             <form method="post" action="/language" class="language-switch" title="{L("Langue de l’interface et des emails", "Interface and email language")}">
                 <input type="hidden" name="return_days" value="{days}">
-                <span aria-hidden="true">🌐</span>
+                <span aria-hidden="true" style="display:{'inline-flex' if lang == 'fr' else 'none'};align-items:center;">
+                    <svg width="22" height="15" viewBox="0 0 30 20" style="border-radius:2px;display:block;">
+                        <rect width="10" height="20" x="0" fill="#0055A4"/>
+                        <rect width="10" height="20" x="10" fill="#FFFFFF"/>
+                        <rect width="10" height="20" x="20" fill="#EF4135"/>
+                    </svg>
+                </span>
+                <span aria-hidden="true" style="display:{'inline-flex' if lang == 'en' else 'none'};align-items:center;">
+                    <svg width="22" height="15" viewBox="0 0 60 36" style="border-radius:2px;display:block;">
+                        <rect width="60" height="36" fill="#012169"/>
+                        <path d="M0 0L60 36M60 0L0 36" stroke="#FFFFFF" stroke-width="7"/>
+                        <path d="M0 0L60 36M60 0L0 36" stroke="#C8102E" stroke-width="3"/>
+                        <path d="M30 0V36M0 18H60" stroke="#FFFFFF" stroke-width="12"/>
+                        <path d="M30 0V36M0 18H60" stroke="#C8102E" stroke-width="7"/>
+                    </svg>
+                </span>
                 <select name="ui_language" aria-label="{L("Langue", "Language")}" onchange="this.form.submit()">
                     <option value="fr"{" selected" if lang == "fr" else ""}>FR</option>
-                    <option value="en"{" selected" if lang == "en" else ""}>EN</option>
+                    <option value="en"{" selected" if lang == "en" else ""}>GB</option>
                 </select>
             </form>
         </div>
