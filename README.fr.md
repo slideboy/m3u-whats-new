@@ -1,8 +1,8 @@
-# M3U What's New
+# Xtream What's New
 
 [English](README.md)
 
-M3U What's New est une application Docker légère qui surveille un catalogue VOD et Séries compatible Xtream et affiche ce qui a changé depuis les scans précédents.
+Xtream What's New est une application Docker légère qui surveille un catalogue VOD et Séries compatible Xtream et affiche ce qui a changé depuis les scans précédents.
 
 Elle ne lit ni ne retransmet les flux : elle surveille uniquement les métadonnées du catalogue exposées par l'API du fournisseur.
 
@@ -28,7 +28,7 @@ C'est la méthode d'installation recommandée.
 L'image Docker publiée contient déjà l'application :
 
 ```text
-ghcr.io/slideboy/m3u-whats-new:latest
+ghcr.io/slideboy/xtream-whats-new:latest
 ```
 
 Il n'est **pas nécessaire** de télécharger `watcher.py`, de créer manuellement un dossier pour l'application ou de créer `config.json`.
@@ -37,24 +37,24 @@ Dans Dockhand ou Portainer, créez une nouvelle Stack et collez le Compose suiva
 
 ```yaml
 services:
-  m3u-whats-new:
-    image: ghcr.io/slideboy/m3u-whats-new:latest
-    container_name: m3u-whats-new
+  xtream-whats-new:
+    image: ghcr.io/slideboy/xtream-whats-new:latest
+    container_name: xtream-whats-new
     restart: unless-stopped
 
     ports:
-      - "${M3U_WHATS_NEW_PORT:-36401}:36401"
+      - "${XTREAM_WHATS_NEW_PORT:-36401}:36401"
 
     environment:
-      M3U_PROVIDER_URL: "${M3U_PROVIDER_URL}"
-      M3U_USERNAME: "${M3U_USERNAME}"
-      M3U_PASSWORD: "${M3U_PASSWORD}"
+      XTREAM_PROVIDER_URL: "${XTREAM_PROVIDER_URL}"
+      XTREAM_USERNAME: "${XTREAM_USERNAME}"
+      XTREAM_PASSWORD: "${XTREAM_PASSWORD}"
       SMTP_USERNAME: "${SMTP_USERNAME:-}"
       SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
       TZ: "${TZ:-Europe/Paris}"
 
     volumes:
-      - m3u-whats-new-data:/data
+      - xtream-whats-new-data:/data
 
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:36401/', timeout=5)"]
@@ -64,8 +64,8 @@ services:
       start_period: 30s
 
 volumes:
-  m3u-whats-new-data:
-    name: m3u-whats-new-data
+  xtream-whats-new-data:
+    name: xtream-whats-new-data
 ```
 
 ### Variables d'environnement
@@ -73,23 +73,23 @@ volumes:
 Avant de déployer la Stack, renseignez dans Dockhand ou Portainer les variables d'environnement suivantes :
 
 ```env
-M3U_PROVIDER_URL=https://votre-fournisseur.example
-M3U_USERNAME=votre_identifiant
-M3U_PASSWORD=votre_mot_de_passe
+XTREAM_PROVIDER_URL=https://votre-fournisseur.example
+XTREAM_USERNAME=votre_identifiant
+XTREAM_PASSWORD=votre_mot_de_passe
 ```
 
 Variables facultatives :
 
 ```env
-M3U_WHATS_NEW_PORT=36401
+XTREAM_WHATS_NEW_PORT=36401
 TZ=Europe/Paris
 SMTP_USERNAME=
 SMTP_PASSWORD=
 ```
 
-`M3U_PROVIDER_URL`, `M3U_USERNAME` et `M3U_PASSWORD` sont obligatoires.
+`XTREAM_PROVIDER_URL`, `XTREAM_USERNAME` et `XTREAM_PASSWORD` sont obligatoires.
 
-`M3U_WHATS_NEW_PORT` est facultatif. S'il n'est pas renseigné, l'application est accessible sur le port `36401`.
+`XTREAM_WHATS_NEW_PORT` est facultatif. S'il n'est pas renseigné, l'application est accessible sur le port `36401`.
 
 `TZ` est facultatif et utilise `Europe/Paris` par défaut.
 
@@ -103,12 +103,12 @@ Déployez ensuite la Stack puis ouvrez :
 http://IP-DE-VOTRE-SERVEUR:36401
 ```
 
-Si vous avez modifié `M3U_WHATS_NEW_PORT`, utilisez le port choisi.
+Si vous avez modifié `XTREAM_WHATS_NEW_PORT`, utilisez le port choisi.
 
 Par exemple, avec :
 
 ```env
-M3U_WHATS_NEW_PORT=36402
+XTREAM_WHATS_NEW_PORT=36402
 ```
 
 ouvrez :
@@ -117,7 +117,7 @@ ouvrez :
 http://IP-DE-VOTRE-SERVEUR:36402
 ```
 
-Au premier démarrage, le conteneur crée automatiquement `/data/config.json` ainsi que la base SQLite dans le volume Docker persistant `m3u-whats-new-data`.
+Au premier démarrage, le conteneur crée automatiquement `/data/config.json` ainsi que la base SQLite dans le volume Docker persistant `xtream-whats-new-data`.
 
 ## Docker Compose en ligne de commande
 
@@ -153,7 +153,7 @@ Ouvrez ensuite :
 http://IP-DE-VOTRE-SERVEUR:36401
 ```
 
-ou utilisez le port défini avec `M3U_WHATS_NEW_PORT`.
+ou utilisez le port défini avec `XTREAM_WHATS_NEW_PORT`.
 
 ## Premier démarrage
 
@@ -183,7 +183,7 @@ Après modification des variables d'environnement de la Stack, recréez ou redé
 Les données persistantes de l'application sont stockées dans `/data` à l'intérieur du conteneur et sauvegardées dans le volume Docker nommé :
 
 ```text
-m3u-whats-new-data
+xtream-whats-new-data
 ```
 
 Il contient notamment :
@@ -198,7 +198,7 @@ En revanche, supprimer le volume Docker **efface la base de données, les param�
 
 Le nom interne historique `nouveautes.sqlite3` est volontairement conservé pour assurer la compatibilité.
 
-Si vous préférez conserver les données persistantes dans un dossier visible de l'hôte, par exemple `/srv/m3u-whats-new`, vous pouvez remplacer le volume Docker nommé par un bind mount dans votre propre configuration Compose.
+Si vous préférez conserver les données persistantes dans un dossier visible de l'hôte, par exemple `/srv/xtream-whats-new`, vous pouvez remplacer le volume Docker nommé par un bind mount dans votre propre configuration Compose.
 
 ## Mise à jour
 
@@ -218,7 +218,7 @@ Le volume Docker persistant est conservé lors des mises à jour normales du con
 Si vous souhaitez construire l'image depuis les sources au lieu d'utiliser l'image publiée sur GHCR :
 
 ```bash
-docker build -t m3u-whats-new:local .
+docker build -t xtream-whats-new:local .
 ```
 
 L'image officielle est construite automatiquement depuis ce dépôt par GitHub Actions pour :
@@ -246,7 +246,7 @@ Ce projet communautaire est proposé selon les disponibilités. Aucun délai de 
 
 ## Avertissement
 
-M3U What's New est un projet indépendant, sans affiliation avec Xtream Codes, les fournisseurs IPTV ou M3U Editor.
+Xtream What's New est un projet indépendant, sans affiliation avec Xtream Codes ou les fournisseurs IPTV.
 
 Utilisez-le uniquement avec des services et des sources de données auxquels vous êtes autorisé à accéder.
 

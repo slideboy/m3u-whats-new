@@ -1,19 +1,19 @@
 services:
-  m3u-whats-new:
-    image: ghcr.io/slideboy/m3u-whats-new:latest
-    container_name: m3u-whats-new
+  xtream-whats-new:
+    image: ghcr.io/slideboy/xtream-whats-new:latest
+    container_name: xtream-whats-new
     restart: unless-stopped
     ports:
-      - "${M3U_WHATS_NEW_PORT:-36401}:36401"
+      - "${XTREAM_WHATS_NEW_PORT:-36401}:36401"
     environment:
-      M3U_PROVIDER_URL: "${M3U_PROVIDER_URL}"
-      M3U_USERNAME: "${M3U_USERNAME}"
-      M3U_PASSWORD: "${M3U_PASSWORD}"
+      XTREAM_PROVIDER_URL: "${XTREAM_PROVIDER_URL}"
+      XTREAM_USERNAME: "${XTREAM_USERNAME}"
+      XTREAM_PASSWORD: "${XTREAM_PASSWORD}"
       SMTP_USERNAME: "${SMTP_USERNAME:-}"
       SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
       TZ: "${TZ:-Europe/Paris}"
     volumes:
-      - m3u-whats-new-data:/data
+      - xtream-whats-new-data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:36401/', timeout=5)"]
       interval: 30s
@@ -22,5 +22,5 @@ services:
       start_period: 30s
 
 volumes:
-  m3u-whats-new-data:
-    name: m3u-whats-new-data
+  xtream-whats-new-data:
+    name: xtream-whats-new-data

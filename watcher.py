@@ -13,6 +13,12 @@ from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 
 HISTORY_RETENTION_DAYS = 45
+DB_MAINTENANCE_INTERVAL_HOURS = 24
+INACTIVE_ITEM_RETENTION_DAYS = 365
+IDENTITY_HISTORY_RETENTION_DAYS = 730
+VACUUM_MIN_FREE_BYTES = 32 * 1024 * 1024
+VACUUM_MIN_FREE_RATIO = 0.25
+VACUUM_MIN_INTERVAL_DAYS = 30
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlencode, urlparse, parse_qs
@@ -29,9 +35,9 @@ SCAN_CHECK_SECONDS = 5
 EMAIL_CHECK_SECONDS = 15
 EMAIL_RETRY_MINUTES = 10
 
-APP_NAME = "M3U What's New"
-APP_VERSION = "1.0.3"
-APP_USER_AGENT = f"Mozilla/5.0 M3U-Whats-New/{APP_VERSION}"
+APP_NAME = "Xtream What's New"
+APP_VERSION = "1.0.4"
+APP_USER_AGENT = f"Mozilla/5.0 Xtream-Whats-New/{APP_VERSION}"
 
 def utc_now():
     return datetime.now(timezone.utc)
@@ -177,9 +183,9 @@ def load_config():
     # Les identifiants du fournisseur sont des secrets et proviennent
     # exclusivement du fichier .env injecté dans le conteneur.
     secret_env = {
-        "provider_url": "M3U_PROVIDER_URL",
-        "username": "M3U_USERNAME",
-        "password": "M3U_PASSWORD",
+        "provider_url": "XTREAM_PROVIDER_URL",
+        "username": "XTREAM_USERNAME",
+        "password": "XTREAM_PASSWORD",
     }
     missing = []
     for key, env_name in secret_env.items():
@@ -532,6 +538,220 @@ def reassociate_movie_id(
     )
 
 
+# Series Identity V1
+# ------------------
+# Le series_id Xtream reste l'identifiant fournisseur. L'identité secondaire est
+# volontairement très stricte car un même TMDB peut coexister en FR/VOST/UHD/etc.
+def series_identity_from_item(item, name=""):
+    year = movie_year_from_item(item, name)
+    tmdb_id = normalize_tmdb_id(
+        _first_movie_value(item, ("tmdb_id", "tmdb", "tmdbid"))
+    )
+    return {
+        "tmdb_id": tmdb_id or None,
+        "year": year,
+        "normalized_name": normalize_movie_title(name, year),
+    }
+
+
+def find_series_reassociation_candidate(
+    conn,
+    new_id,
+    identity,
+    new_category,
+    provider_series_ids,
+):
+    """Correspondance unique seulement; aucune fusion de variantes coexistantes."""
+    provider_series_ids = {safe_text(x) for x in provider_series_ids}
+    new_norm = safe_text(identity.get("normalized_name")).strip()
+    new_category_norm = normalize_category_name(new_category)
+
+    def eligible(rows):
+        out = []
+        for row in rows:
+            old_id = safe_text(row["id"])
+            if old_id in provider_series_ids:
+                # Ancien et nouvel ID coexistent : ce sont deux entrées distinctes.
+                continue
+            if normalize_category_name(row["category"]) != new_category_norm:
+                continue
+            old_norm = safe_text(row["normalized_name"]).strip()
+            if not old_norm:
+                old_year = row["year"] if "year" in row.keys() else None
+                old_norm = normalize_movie_title(row["name"], old_year)
+            if not new_norm or old_norm != new_norm:
+                continue
+            out.append(row)
+        return out
+
+    tmdb = safe_text(identity.get("tmdb_id")).strip()
+    if tmdb:
+        rows = conn.execute("""
+            SELECT * FROM series
+            WHERE active=1 AND id<>? AND tmdb_id=?
+        """, (safe_text(new_id), tmdb)).fetchall()
+        candidates = eligible(rows)
+        if len(candidates) == 1:
+            return candidates[0], "tmdb_title"
+        if len(candidates) > 1:
+            return None, None
+
+    year = identity.get("year")
+    if new_norm and year:
+        rows = conn.execute("""
+            SELECT * FROM series
+            WHERE active=1 AND id<>? AND normalized_name=? AND year=?
+        """, (safe_text(new_id), new_norm, int(year))).fetchall()
+        candidates = eligible(rows)
+        if len(candidates) == 1:
+            return candidates[0], "title_year"
+
+    return None, None
+
+
+def reassociate_series_id(
+    conn,
+    old_row,
+    new_id,
+    name,
+    category,
+    last_modified,
+    identity,
+    now,
+    matched_by,
+):
+    """Transfère série + cache épisodes vers le nouvel ID sans événement utilisateur."""
+    old_id = safe_text(old_row["id"])
+    new_id = safe_text(new_id)
+
+    # Garde supplémentaire contre un éventuel cache orphelin sous le nouvel ID.
+    if conn.execute(
+        "SELECT 1 FROM episodes WHERE series_id=? LIMIT 1", (new_id,)
+    ).fetchone():
+        return False
+
+    conn.execute("UPDATE episodes SET series_id=? WHERE series_id=?", (new_id, old_id))
+    conn.execute("""
+        UPDATE series SET
+            id=?,name=?,category=?,
+            seen_last_modified=COALESCE(NULLIF(?,''),seen_last_modified),
+            normalized_name=?,year=COALESCE(?,year),tmdb_id=COALESCE(?,tmdb_id),
+            last_seen=?,active=1,missing_count=0
+        WHERE id=?
+    """, (
+        new_id,
+        safe_text(name),
+        safe_text(category),
+        safe_text(last_modified),
+        safe_text(identity.get("normalized_name")) or None,
+        identity.get("year"),
+        safe_text(identity.get("tmdb_id")) or None,
+        now,
+        old_id,
+    ))
+    conn.execute("""
+        INSERT INTO series_id_changes(
+            old_id,new_id,matched_by,detected_at,name,category
+        ) VALUES(?,?,?,?,?,?)
+    """, (
+        old_id,new_id,safe_text(matched_by),now,safe_text(name),safe_text(category)
+    ))
+    print(
+        f"[INFO] Series Identity V1: série réassociée {old_id} -> {new_id} "
+        f"({matched_by}, {safe_text(name)})",
+        flush=True,
+    )
+    return True
+
+
+def episode_identity_key(row):
+    """Identité fonctionnelle V1 : saison + numéro, si le numéro est exploitable."""
+    try:
+        season = int(row["season"] if isinstance(row, sqlite3.Row) else row.get("season"))
+        epnum = int(row["episode_num"] if isinstance(row, sqlite3.Row) else row.get("episode_num"))
+    except Exception:
+        return None
+    if season < 0 or epnum <= 0:
+        return None
+    return season, epnum
+
+
+def reassociate_episode_ids(conn, series_id, current_eps, now):
+    """Réassocie les episode_id changés quand SxxExx reste unique des deux côtés."""
+    old_rows = conn.execute(
+        "SELECT * FROM episodes WHERE series_id=?", (safe_text(series_id),)
+    ).fetchall()
+    if not old_rows:
+        return 0
+
+    old_ids = {safe_text(r["episode_id"]) for r in old_rows}
+    current_ids = {safe_text(e.get("episode_id")) for e in current_eps}
+
+    old_by_key = {}
+    old_dupes = set()
+    for row in old_rows:
+        key = episode_identity_key(row)
+        if key is None:
+            continue
+        if key in old_by_key:
+            old_dupes.add(key)
+        else:
+            old_by_key[key] = row
+
+    current_by_key = {}
+    current_dupes = set()
+    for e in current_eps:
+        key = episode_identity_key(e)
+        if key is None:
+            continue
+        if key in current_by_key:
+            current_dupes.add(key)
+        else:
+            current_by_key[key] = e
+
+    changed = 0
+    for key, e in current_by_key.items():
+        if key in current_dupes or key in old_dupes:
+            continue
+        new_eid = safe_text(e.get("episode_id"))
+        if not new_eid or new_eid in old_ids:
+            continue
+        old = old_by_key.get(key)
+        if old is None:
+            continue
+        old_eid = safe_text(old["episode_id"])
+        if old_eid in current_ids:
+            # Les deux IDs coexistent : surtout ne pas fusionner.
+            continue
+
+        conn.execute("""
+            UPDATE episodes SET
+                episode_id=?,title=?,provider_added=COALESCE(?,provider_added)
+            WHERE series_id=? AND episode_id=?
+        """, (
+            new_eid,
+            safe_text(e.get("title")),
+            e.get("provider_added"),
+            safe_text(series_id),
+            old_eid,
+        ))
+        conn.execute("""
+            INSERT INTO episode_id_changes(
+                series_id,old_id,new_id,season,episode_num,detected_at,title
+            ) VALUES(?,?,?,?,?,?,?)
+        """, (
+            safe_text(series_id),old_eid,new_eid,key[0],key[1],now,safe_text(e.get("title"))
+        ))
+        print(
+            f"[INFO] Episode Identity V1: {series_id} S{key[0]:02d}E{key[1]:02d} "
+            f"réassocié {old_eid} -> {new_eid}",
+            flush=True,
+        )
+        changed += 1
+
+    return changed
+
+
 def init_db():
     with db() as c:
         c.executescript("""
@@ -632,6 +852,31 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_movie_id_changes_time
             ON movie_id_changes(detected_at DESC);
 
+        CREATE TABLE IF NOT EXISTS series_id_changes (
+            change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            old_id TEXT NOT NULL,
+            new_id TEXT NOT NULL,
+            matched_by TEXT NOT NULL,
+            detected_at TEXT NOT NULL,
+            name TEXT,
+            category TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_series_id_changes_time
+            ON series_id_changes(detected_at DESC);
+
+        CREATE TABLE IF NOT EXISTS episode_id_changes (
+            change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            series_id TEXT NOT NULL,
+            old_id TEXT NOT NULL,
+            new_id TEXT NOT NULL,
+            season INTEGER,
+            episode_num INTEGER,
+            detected_at TEXT NOT NULL,
+            title TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_episode_id_changes_time
+            ON episode_id_changes(detected_at DESC);
+
         CREATE TABLE IF NOT EXISTS email_digest_queue (
             event_key TEXT PRIMARY KEY,
             queued_at TEXT NOT NULL
@@ -675,6 +920,29 @@ def init_db():
 
         ensure_column(c, "series", "active", "INTEGER NOT NULL DEFAULT 1")
         ensure_column(c, "series", "missing_count", "INTEGER NOT NULL DEFAULT 0")
+        # Series Identity V1 : TMDB + titre normalisé + année, sans appel réseau.
+        ensure_column(c, "series", "normalized_name", "TEXT")
+        ensure_column(c, "series", "year", "INTEGER")
+        ensure_column(c, "series", "tmdb_id", "TEXT")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_series_tmdb_id ON series(tmdb_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_series_title_year ON series(normalized_name,year)")
+
+        series_rows_to_backfill = c.execute("""
+            SELECT id,name,normalized_name,year
+            FROM series
+            WHERE normalized_name IS NULL OR normalized_name=''
+        """).fetchall()
+        for series_row in series_rows_to_backfill:
+            inferred_year = movie_year_from_item({}, series_row["name"])
+            c.execute("""
+                UPDATE series SET normalized_name=?, year=COALESCE(year,?)
+                WHERE id=?
+            """, (
+                normalize_movie_title(series_row["name"], inferred_year),
+                inferred_year,
+                series_row["id"],
+            ))
+
         ensure_column(c, "categories", "active", "INTEGER NOT NULL DEFAULT 1")
         ensure_column(c, "categories", "missing_count", "INTEGER NOT NULL DEFAULT 0")
         # Une catégorie nouvellement activée doit d'abord être absorbée comme
@@ -2085,6 +2353,193 @@ def cleanup_old_events(conn):
     set_meta(conn, "last_cleanup_deleted", cur.rowcount)
     return cur.rowcount
 
+def _meta_datetime(conn, key):
+    raw = safe_text(get_meta(conn, key, "")).strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def db_maintenance_due(conn, now=None):
+    now = now or utc_now()
+    last = _meta_datetime(conn, "db_maintenance_last_run")
+    if last is None:
+        return True
+    return now - last >= timedelta(hours=DB_MAINTENANCE_INTERVAL_HOURS)
+
+
+def sqlite_space_stats(conn):
+    page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+    page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+    free_pages = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+    free_bytes = free_pages * page_size
+    free_ratio = (free_pages / page_count) if page_count else 0.0
+    return {
+        "page_size": page_size,
+        "page_count": page_count,
+        "free_pages": free_pages,
+        "free_bytes": free_bytes,
+        "free_ratio": free_ratio,
+    }
+
+
+def db_vacuum_due(conn, stats=None, now=None):
+    now = now or utc_now()
+    stats = stats or sqlite_space_stats(conn)
+    if stats["free_bytes"] < VACUUM_MIN_FREE_BYTES:
+        return False
+    if stats["free_ratio"] < VACUUM_MIN_FREE_RATIO:
+        return False
+    last = _meta_datetime(conn, "db_vacuum_last_run")
+    if last is not None and now - last < timedelta(days=VACUUM_MIN_INTERVAL_DAYS):
+        return False
+    return True
+
+
+def run_db_maintenance(conn, force=False):
+    """Entretien conservateur de la base, au plus une fois par jour.
+
+    Les films/séries inactifs sont gardés un an afin qu'une disparition temporaire
+    suivie d'un retour avec le même ID fournisseur ne soit pas annoncée comme une
+    nouveauté. Les historiques techniques d'identité sont gardés deux ans.
+    """
+    now = utc_now()
+    if not force and not db_maintenance_due(conn, now):
+        return None
+
+    inactive_cutoff = (now - timedelta(days=INACTIVE_ITEM_RETENTION_DAYS)).isoformat()
+    identity_cutoff = (now - timedelta(days=IDENTITY_HISTORY_RETENTION_DAYS)).isoformat()
+
+    # Supprimer d'abord le cache épisodes des séries réellement anciennes.
+    old_series_ids = [
+        safe_text(r[0]) for r in conn.execute(
+            """
+            SELECT id FROM series
+            WHERE active=0 AND last_seen IS NOT NULL AND last_seen < ?
+            """,
+            (inactive_cutoff,),
+        ).fetchall()
+    ]
+
+    deleted_episodes = 0
+    if old_series_ids:
+        placeholders = ",".join("?" for _ in old_series_ids)
+        cur = conn.execute(
+            f"DELETE FROM episodes WHERE series_id IN ({placeholders})",
+            old_series_ids,
+        )
+        deleted_episodes += max(0, int(cur.rowcount or 0))
+
+    # Un épisode sans série est inutilisable et ne peut plus être suivi.
+    cur = conn.execute(
+        """
+        DELETE FROM episodes
+        WHERE series_id NOT IN (SELECT id FROM series)
+        """
+    )
+    deleted_orphans = max(0, int(cur.rowcount or 0))
+    deleted_episodes += deleted_orphans
+
+    cur = conn.execute(
+        """
+        DELETE FROM series
+        WHERE active=0 AND last_seen IS NOT NULL AND last_seen < ?
+        """,
+        (inactive_cutoff,),
+    )
+    deleted_series = max(0, int(cur.rowcount or 0))
+
+    cur = conn.execute(
+        """
+        DELETE FROM movies
+        WHERE active=0 AND last_seen IS NOT NULL AND last_seen < ?
+        """,
+        (inactive_cutoff,),
+    )
+    deleted_movies = max(0, int(cur.rowcount or 0))
+
+    history_deleted = {}
+    for table in ("movie_id_changes", "series_id_changes", "episode_id_changes"):
+        cur = conn.execute(
+            f"DELETE FROM {table} WHERE detected_at < ?",
+            (identity_cutoff,),
+        )
+        history_deleted[table] = max(0, int(cur.rowcount or 0))
+
+    # Laisse SQLite mettre à jour ses statistiques sans coût important.
+    try:
+        conn.execute("PRAGMA optimize")
+    except Exception:
+        pass
+
+    set_meta(conn, "db_maintenance_last_run", now.isoformat())
+    set_meta(conn, "db_maintenance_inactive_days", INACTIVE_ITEM_RETENTION_DAYS)
+    set_meta(conn, "db_maintenance_identity_days", IDENTITY_HISTORY_RETENTION_DAYS)
+    set_meta(conn, "db_maintenance_deleted_movies", deleted_movies)
+    set_meta(conn, "db_maintenance_deleted_series", deleted_series)
+    set_meta(conn, "db_maintenance_deleted_episodes", deleted_episodes)
+    set_meta(conn, "db_maintenance_deleted_orphans", deleted_orphans)
+    set_meta(conn, "db_maintenance_deleted_movie_id_changes", history_deleted["movie_id_changes"])
+    set_meta(conn, "db_maintenance_deleted_series_id_changes", history_deleted["series_id_changes"])
+    set_meta(conn, "db_maintenance_deleted_episode_id_changes", history_deleted["episode_id_changes"])
+    conn.commit()
+
+    before = sqlite_space_stats(conn)
+    vacuumed = False
+    vacuum_error = ""
+    if db_vacuum_due(conn, before, now):
+        try:
+            # VACUUM exige d'être hors transaction. Le LOCK applicatif du scan
+            # empêche les opérations longues concurrentes; en cas de verrou tiers,
+            # on reporte simplement au prochain entretien.
+            conn.execute("VACUUM")
+            vacuumed = True
+            set_meta(conn, "db_vacuum_last_run", iso_now())
+            set_meta(conn, "db_vacuum_last_error", "")
+            conn.commit()
+        except Exception as exc:
+            vacuum_error = safe_text(exc)[:300]
+            set_meta(conn, "db_vacuum_last_error", vacuum_error)
+            conn.commit()
+
+    after = sqlite_space_stats(conn)
+    set_meta(conn, "db_maintenance_free_bytes", after["free_bytes"])
+    set_meta(conn, "db_maintenance_free_ratio", f"{after['free_ratio']:.6f}")
+    set_meta(conn, "db_maintenance_vacuumed", "1" if vacuumed else "0")
+    conn.commit()
+
+    total_deleted = (
+        deleted_movies + deleted_series + deleted_episodes
+        + sum(history_deleted.values())
+    )
+    print(
+        f"[OK] Entretien DB: {deleted_movies} film(s), {deleted_series} série(s), "
+        f"{deleted_episodes} épisode(s), {sum(history_deleted.values())} historique(s) "
+        f"supprimé(s); libre {after['free_bytes'] / 1024 / 1024:.1f} MB "
+        f"({after['free_ratio'] * 100:.1f}%); VACUUM={'oui' if vacuumed else 'non'}."
+        , flush=True
+    )
+    if vacuum_error:
+        print(f"[WARN] VACUUM reporté : {vacuum_error}", flush=True)
+
+    return {
+        "deleted": total_deleted,
+        "deleted_movies": deleted_movies,
+        "deleted_series": deleted_series,
+        "deleted_episodes": deleted_episodes,
+        "deleted_orphans": deleted_orphans,
+        "history_deleted": history_deleted,
+        "vacuumed": vacuumed,
+        "free_bytes": after["free_bytes"],
+        "free_ratio": after["free_ratio"],
+    }
+
 def api(action=None, **params):
     q = {"username": CFG["username"], "password": CFG["password"]}
     if action:
@@ -2771,6 +3226,10 @@ def process_pending_series(conn, scan_errors=None, monitored_categories=None):
             current_eps = normalize_episode_rows(sid, info if isinstance(info, dict) else {})
             current_ids = {e["episode_id"] for e in current_eps}
 
+            # Episode Identity V1 : si seul l'ID fournisseur change alors que
+            # SxxExx reste unique, on réassocie avant de calculer ajouts/suppressions.
+            reassociate_episode_ids(conn, sid, current_eps, iso_now())
+
             old_rows = conn.execute("""
                 SELECT * FROM episodes WHERE series_id=?
             """, (sid,)).fetchall()
@@ -2894,6 +3353,10 @@ def sync_once():
                     f"[OK] Rétention : {deleted} ancienne(s) nouveauté(s) supprimée(s).",
                     flush=True
                 )
+
+            # Entretien léger quotidien : rétention longue des éléments techniques
+            # et VACUUM uniquement si un volume significatif est réellement récupérable.
+            run_db_maintenance(conn)
 
             baseline = get_meta(conn, "baseline_complete", "0") == "1"
             category_baseline = get_meta(conn, "category_baseline_complete", "0") == "1"
@@ -3089,6 +3552,11 @@ def sync_once():
                 # Séries présentes
                 current_series_ids = set()
                 missing_lm = 0
+                provider_series_ids = {
+                    safe_text(x.get("series_id") or x.get("id"))
+                    for x in series_items
+                    if safe_text(x.get("series_id") or x.get("id"))
+                }
 
                 for s in series_items:
                     sid = safe_text(s.get("series_id") or s.get("id"))
@@ -3099,98 +3567,156 @@ def sync_once():
                     name = safe_text(s.get("name")) or f"Série {sid}"
                     cat = category_name_for(s, selected_series)
                     lm = safe_text(s.get("last_modified"))
+                    identity = series_identity_from_item(s, name)
 
                     if not lm:
                         missing_lm += 1
 
                     row = conn.execute("SELECT * FROM series WHERE id=?", (sid,)).fetchone()
+                    series_reassociated = False
 
                     activation_baseline = item_is_activation_baseline(
                         s, selected_series, pending_series_baselines
                     )
 
                     if row is None:
-                        # Lors de l'activation d'une catégorie déjà remplie, la série
-                        # courante devient simplement l'état de référence. On ne va
-                        # pas chercher tous ses épisodes historiques : au prochain
-                        # vrai changement, la logique habituelle reprendra la main.
-                        if activation_baseline:
-                            conn.execute("""
-                                INSERT INTO series(
-                                    id,name,category,seen_last_modified,fetched_last_modified,
-                                    first_seen,last_seen,pending,pending_since,is_new,retry_count,
-                                    active,missing_count
-                                ) VALUES(?,?,?,?,?,?,?,?,?,?,0,1,0)
-                            """, (
-                                sid, name, cat, lm, lm, now, now,
-                                0, None, 0
-                            ))
-                        else:
-                            conn.execute("""
-                                INSERT INTO series(
-                                    id,name,category,seen_last_modified,fetched_last_modified,
-                                    first_seen,last_seen,pending,pending_since,is_new,retry_count,
-                                    active,missing_count
-                                ) VALUES(?,?,?,?,?,?,?,?,?,?,0,1,0)
-                            """, (
-                                sid, name, cat, lm, None, now, now,
-                                1 if baseline else 0,
-                                previous_success if baseline else None,
-                                1 if baseline else 0
-                            ))
+                        old_row = None
+                        matched_by = None
+                        if baseline and not activation_baseline:
+                            old_row, matched_by = find_series_reassociation_candidate(
+                                conn,
+                                sid,
+                                identity,
+                                cat,
+                                provider_series_ids,
+                            )
 
-                            if baseline:
-                                add_event(
-                                    conn, f"series:{sid}", "series", sid,
-                                    name, "", cat, s.get("added"), now
-                                )
+                        if old_row is not None and reassociate_series_id(
+                            conn,
+                            old_row,
+                            sid,
+                            name,
+                            cat,
+                            lm,
+                            identity,
+                            now,
+                            matched_by,
+                        ):
+                            row = conn.execute(
+                                "SELECT * FROM series WHERE id=?", (sid,)
+                            ).fetchone()
+                            series_reassociated = True
+                        else:
+                            # Lors de l'activation d'une catégorie déjà remplie, la série
+                            # courante devient simplement l'état de référence. On ne va
+                            # pas chercher tous ses épisodes historiques : au prochain
+                            # vrai changement, la logique habituelle reprendra la main.
+                            if activation_baseline:
+                                conn.execute("""
+                                    INSERT INTO series(
+                                        id,name,category,seen_last_modified,fetched_last_modified,
+                                        first_seen,last_seen,pending,pending_since,is_new,retry_count,
+                                        active,missing_count,normalized_name,year,tmdb_id
+                                    ) VALUES(?,?,?,?,?,?,?,?,?,?,0,1,0,?,?,?)
+                                """, (
+                                    sid, name, cat, lm, lm, now, now,
+                                    0, None, 0,
+                                    identity.get("normalized_name"),
+                                    identity.get("year"),
+                                    identity.get("tmdb_id"),
+                                ))
+                            else:
+                                conn.execute("""
+                                    INSERT INTO series(
+                                        id,name,category,seen_last_modified,fetched_last_modified,
+                                        first_seen,last_seen,pending,pending_since,is_new,retry_count,
+                                        active,missing_count,normalized_name,year,tmdb_id
+                                    ) VALUES(?,?,?,?,?,?,?,?,?,?,0,1,0,?,?,?)
+                                """, (
+                                    sid, name, cat, lm, None, now, now,
+                                    1 if baseline else 0,
+                                    previous_success if baseline else None,
+                                    1 if baseline else 0,
+                                    identity.get("normalized_name"),
+                                    identity.get("year"),
+                                    identity.get("tmdb_id"),
+                                ))
+
+                                if baseline:
+                                    add_event(
+                                        conn, f"series:{sid}", "series", sid,
+                                        name, "", cat, s.get("added"), now
+                                    )
+                            continue
+
+                    # Série déjà connue, ou réassociée ci-dessus.
+                    old_lm = safe_text(row["seen_last_modified"])
+                    # Une réassociation de series_id force un contrôle détaillé :
+                    # le panel peut avoir renuméroté aussi les episode_id sans
+                    # modifier last_modified. Episode Identity V1 absorbera ce cas.
+                    changed = series_reassociated or bool(lm and old_lm and lm != old_lm)
+
+                    if activation_baseline:
+                        # Réactivation d'une catégorie déjà suivie autrefois :
+                        # l'ancien détail d'épisodes ne sert plus de baseline.
+                        conn.execute("DELETE FROM episodes WHERE series_id=?", (sid,))
+                        conn.execute("""
+                            UPDATE series SET
+                                name=?,category=?,seen_last_modified=?,
+                                fetched_last_modified=?,last_seen=?,pending=0,
+                                pending_since=NULL,is_new=0,retry_count=0,
+                                active=1,missing_count=0,
+                                normalized_name=?,year=COALESCE(?,year),tmdb_id=COALESCE(?,tmdb_id)
+                            WHERE id=?
+                        """, (
+                            name, cat, lm, lm, now,
+                            identity.get("normalized_name"),identity.get("year"),
+                            identity.get("tmdb_id"),sid
+                        ))
+                    elif int(row["is_new"]):
+                        # Une vraie nouvelle série pas encore détaillée doit rester
+                        # en mode baseline épisodes jusqu'à son traitement.
+                        conn.execute("""
+                            UPDATE series SET
+                                name=?,category=?,seen_last_modified=?,last_seen=?,
+                                active=1,missing_count=0,
+                                normalized_name=?,year=COALESCE(?,year),tmdb_id=COALESCE(?,tmdb_id)
+                            WHERE id=?
+                        """, (
+                            name,cat,lm or old_lm,now,
+                            identity.get("normalized_name"),identity.get("year"),
+                            identity.get("tmdb_id"),sid
+                        ))
+                    elif changed:
+                        conn.execute("""
+                            UPDATE series SET
+                                name=?,category=?,seen_last_modified=?,last_seen=?,
+                                pending=1,
+                                pending_since=COALESCE(pending_since,?),
+                                is_new=0,active=1,missing_count=0,
+                                normalized_name=?,year=COALESCE(?,year),tmdb_id=COALESCE(?,tmdb_id)
+                            WHERE id=?
+                        """, (
+                            name,cat,lm,now,previous_success,
+                            identity.get("normalized_name"),identity.get("year"),
+                            identity.get("tmdb_id"),sid
+                        ))
                     else:
-                        old_lm = safe_text(row["seen_last_modified"])
-                        changed = bool(lm and old_lm and lm != old_lm)
-
-                        if activation_baseline:
-                            # Réactivation d'une catégorie déjà suivie autrefois :
-                            # on jette l'ancien détail d'épisodes pour ne pas signaler
-                            # comme nouveaux/supprimés les changements survenus pendant
-                            # la période où cette catégorie n'était plus surveillée.
-                            conn.execute("DELETE FROM episodes WHERE series_id=?", (sid,))
-                            conn.execute("""
-                                UPDATE series SET
-                                    name=?,category=?,seen_last_modified=?,
-                                    fetched_last_modified=?,last_seen=?,pending=0,
-                                    pending_since=NULL,is_new=0,retry_count=0,
-                                    active=1,missing_count=0
-                                WHERE id=?
-                            """, (name, cat, lm, lm, now, sid))
-                        elif int(row["is_new"]):
-                            # Une vraie nouvelle série pas encore détaillée doit rester
-                            # en mode baseline épisodes jusqu'à son traitement.
-                            conn.execute("""
-                                UPDATE series SET
-                                    name=?,category=?,seen_last_modified=?,last_seen=?,
-                                    active=1,missing_count=0
-                                WHERE id=?
-                            """, (name, cat, lm or old_lm, now, sid))
-                        elif changed:
-                            conn.execute("""
-                                UPDATE series SET
-                                    name=?,category=?,seen_last_modified=?,last_seen=?,
-                                    pending=1,
-                                    pending_since=COALESCE(pending_since,?),
-                                    is_new=0,active=1,missing_count=0
-                                WHERE id=?
-                            """, (name, cat, lm, now, previous_success, sid))
-                        else:
-                            conn.execute("""
-                                UPDATE series SET
-                                    name=?,category=?,
-                                    seen_last_modified=CASE
-                                        WHEN seen_last_modified IS NULL OR seen_last_modified='' THEN ?
-                                        ELSE seen_last_modified
-                                    END,
-                                    last_seen=?,active=1,missing_count=0
-                                WHERE id=?
-                            """, (name, cat, lm, now, sid))
+                        conn.execute("""
+                            UPDATE series SET
+                                name=?,category=?,
+                                seen_last_modified=CASE
+                                    WHEN seen_last_modified IS NULL OR seen_last_modified='' THEN ?
+                                    ELSE seen_last_modified
+                                END,
+                                last_seen=?,active=1,missing_count=0,
+                                normalized_name=?,year=COALESCE(?,year),tmdb_id=COALESCE(?,tmdb_id)
+                            WHERE id=?
+                        """, (
+                            name,cat,lm,now,
+                            identity.get("normalized_name"),identity.get("year"),
+                            identity.get("tmdb_id"),sid
+                        ))
 
                 # Les catégories nouvellement activées viennent maintenant d'être
                 # absorbées comme état de référence. Aux scans suivants, leurs

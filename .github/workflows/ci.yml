@@ -29,4 +29,4 @@ jobs:
           docker compose config > /dev/null
 
       - name: Build Docker image
-        run: docker build -t m3u-whats-new:test .
+        run: docker build -t xtream-whats-new:test .

@@ -1,6 +1,6 @@
 # Security
 
-M3U What's New handles private provider and SMTP credentials.
+Xtream What's New handles private provider and SMTP credentials.
 
 - Never commit your `.env` file.
 - Never post provider URLs, usernames, passwords, SMTP credentials, SQLite databases, or backup files in public issues.

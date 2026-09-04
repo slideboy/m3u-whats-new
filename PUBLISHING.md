@@ -1,6 +1,6 @@
 # Publishing notes
 
-Maintainer checklist for M3U What's New.
+Maintainer checklist for Xtream What's New.
 
 ## Release policy
 
@@ -13,7 +13,7 @@ Examples:
 ```text
 README update        → no Docker image
 Documentation update → no Docker image
-Tag v1.0.1           → Docker image published
+Tag v1.0.4           → Docker image published
 ```
 
 The publishing workflow is:
@@ -24,7 +24,7 @@ The publishing workflow is:
 
 ## Version numbering
 
-M3U What's New follows semantic versioning:
+Xtream What's New follows semantic versioning:
 
 ```text
 vMAJOR.MINOR.PATCH
@@ -45,7 +45,7 @@ Do not create a new release only for README or documentation changes.
 When a release tag such as:
 
 ```text
-v1.0.1
+v1.0.4
 ```
 
 is published, GitHub Actions builds the Docker image for:
@@ -58,10 +58,10 @@ linux/arm64
 and publishes the following GHCR tags:
 
 ```text
-ghcr.io/slideboy/m3u-whats-new:v1.0.1
-ghcr.io/slideboy/m3u-whats-new:1.0.1
-ghcr.io/slideboy/m3u-whats-new:1.0
-ghcr.io/slideboy/m3u-whats-new:latest
+ghcr.io/slideboy/xtream-whats-new:v1.0.4
+ghcr.io/slideboy/xtream-whats-new:1.0.4
+ghcr.io/slideboy/xtream-whats-new:1.0
+ghcr.io/slideboy/xtream-whats-new:latest
 ```
 
 `latest` therefore points to the most recent official release.
@@ -69,13 +69,13 @@ ghcr.io/slideboy/m3u-whats-new:latest
 The public Compose file continues to use:
 
 ```text
-ghcr.io/slideboy/m3u-whats-new:latest
+ghcr.io/slideboy/xtream-whats-new:latest
 ```
 
 Users who prefer to pin a specific version may instead use, for example:
 
 ```text
-ghcr.io/slideboy/m3u-whats-new:v1.0.0
+ghcr.io/slideboy/xtream-whats-new:v1.0.4
 ```
 
 ## Publishing a new release
@@ -97,7 +97,7 @@ Then:
 3. Create a new tag using semantic versioning, for example:
 
 ```text
-v1.0.1
+v1.0.4
 ```
 
 4. Target the `main` branch.
@@ -111,7 +111,7 @@ Creating the `v*` tag automatically triggers the **Publish Docker image** workfl
 Verify that:
 
 - The **Publish Docker image** workflow is green.
-- The new version appears under **Packages → m3u-whats-new**.
+- The new version appears under **Packages → xtream-whats-new**.
 - The versioned Docker tag exists.
 - `latest` points to the new release.
 - The public GHCR package can still be pulled without authentication.
@@ -119,18 +119,18 @@ Verify that:
 Example:
 
 ```bash
-docker pull ghcr.io/slideboy/m3u-whats-new:v1.0.1
+docker pull ghcr.io/slideboy/xtream-whats-new:v1.0.4
 ```
 
 Optionally test:
 
 ```bash
-docker pull ghcr.io/slideboy/m3u-whats-new:latest
+docker pull ghcr.io/slideboy/xtream-whats-new:latest
 ```
 
 ## GHCR package visibility
 
-The `m3u-whats-new` package is intended to remain **Public** so Docker, Dockhand, Portainer and Docker Compose users can pull the image without GitHub authentication.
+The `xtream-whats-new` package is intended to remain **Public** so Docker, Dockhand, Portainer and Docker Compose users can pull the image without GitHub authentication.
 
 Do not change the package visibility unless there is a specific reason to do so.
 
@@ -154,6 +154,6 @@ Recommended checks:
 
 ## Support
 
-M3U What's New is a best-effort community project.
+Xtream What's New is a best-effort community project.
 
 Publishing a release does not imply any guaranteed support response time, maintenance schedule or commitment to future development.
