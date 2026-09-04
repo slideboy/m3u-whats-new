@@ -8,6 +8,7 @@ import ssl
 import threading
 import time
 import traceback
+import unicodedata
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 
@@ -29,8 +30,8 @@ EMAIL_CHECK_SECONDS = 15
 EMAIL_RETRY_MINUTES = 10
 
 APP_NAME = "M3U What's New"
-APP_VERSION = "1.0.2"
-APP_USER_AGENT = "Mozilla/5.0 M3U-Whats-New/1.0"
+APP_VERSION = "1.0.3"
+APP_USER_AGENT = f"Mozilla/5.0 M3U-Whats-New/{APP_VERSION}"
 
 def utc_now():
     return datetime.now(timezone.utc)
@@ -265,6 +266,272 @@ def ensure_column(conn, table, column, definition):
     if column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
+
+# Movie Identity V1
+# -----------------
+# Le stream_id Xtream reste l'identifiant fournisseur. Ces helpers ajoutent une
+# identité secondaire, volontairement conservatrice, pour éviter qu'un simple
+# changement de stream_id ne soit annoncé comme un nouveau film.
+def _movie_dict_sources(item):
+    sources = [item] if isinstance(item, dict) else []
+    if isinstance(item, dict) and isinstance(item.get("info"), dict):
+        sources.append(item["info"])
+    return sources
+
+
+def _first_movie_value(item, keys):
+    for source in _movie_dict_sources(item):
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def normalize_tmdb_id(value):
+    text = safe_text(value).strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"\d+", text):
+        # "0" est fréquemment utilisé comme valeur "inconnue" par les panels.
+        value_int = int(text)
+        return str(value_int) if value_int > 0 else ""
+    m = re.search(r"(?:movie/|tv/|tmdb[:=/\s-]*)(\d{1,12})", text, re.IGNORECASE)
+    return str(int(m.group(1))) if m else ""
+
+
+def normalize_imdb_id(value):
+    text = safe_text(value).strip()
+    if not text:
+        return ""
+    m = re.search(r"\btt\d{5,12}\b", text, re.IGNORECASE)
+    return m.group(0).lower() if m else ""
+
+
+def movie_year_from_item(item, name=""):
+    # On privilégie les champs structurés du fournisseur.
+    raw = _first_movie_value(
+        item,
+        ("year", "release_year", "releaseDate", "release_date", "releasedate", "released"),
+    )
+    if raw not in (None, ""):
+        m = re.search(r"\b(19\d{2}|20\d{2})\b", safe_text(raw))
+        if m:
+            return int(m.group(1))
+
+    # Repli prudent : uniquement une année explicitement délimitée dans le nom.
+    # Un film réellement intitulé "1917" n'est donc jamais interprété comme
+    # "titre vide + année 1917".
+    title = safe_text(name).strip()
+    patterns = (
+        r"[\(\[\{]\s*(19\d{2}|20\d{2})\s*[\)\]\}]\s*$",
+        r"\s[-–—]\s*(19\d{2}|20\d{2})\s*$",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, title)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def normalize_movie_title(name, year=None):
+    text = unicodedata.normalize("NFKC", safe_text(name)).casefold().strip()
+    if year:
+        y = re.escape(str(year))
+        text = re.sub(rf"[\(\[\{{]\s*{y}\s*[\)\]\}}]", " ", text)
+        text = re.sub(rf"\s[-–—]\s*{y}\s*$", " ", text)
+    # Normalisation légère : ponctuation/espaces seulement. V1 ne fait pas de
+    # fuzzy matching et ne supprime pas les tags 4K/FHD afin de rester prudente.
+    text = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE)
+    return " ".join(text.split())
+
+
+def movie_identity_from_item(item, name=""):
+    year = movie_year_from_item(item, name)
+    tmdb_id = normalize_tmdb_id(
+        _first_movie_value(item, ("tmdb_id", "tmdb", "tmdbid"))
+    )
+    imdb_id = normalize_imdb_id(
+        _first_movie_value(item, ("imdb_id", "imdb", "imdbid"))
+    )
+    return {
+        "tmdb_id": tmdb_id or None,
+        "imdb_id": imdb_id or None,
+        "year": year,
+        "normalized_name": normalize_movie_title(name, year),
+    }
+
+
+def _movie_row_identity(row):
+    # Compatible avec une base juste migrée : les anciennes lignes n'ont pas
+    # encore forcément leurs nouvelles colonnes renseignées.
+    keys = set(row.keys())
+    name = safe_text(row["name"])
+    year = row["year"] if "year" in keys else None
+    try:
+        year = int(year) if year not in (None, "") else None
+    except Exception:
+        year = None
+    if year is None:
+        year = movie_year_from_item({}, name)
+
+    normalized = safe_text(row["normalized_name"]) if "normalized_name" in keys else ""
+    if not normalized:
+        normalized = normalize_movie_title(name, year)
+
+    return {
+        "tmdb_id": safe_text(row["tmdb_id"]).strip() if "tmdb_id" in keys else "",
+        "imdb_id": safe_text(row["imdb_id"]).strip() if "imdb_id" in keys else "",
+        "year": year,
+        "normalized_name": normalized,
+    }
+
+
+def _movie_category_compatible(old_category, new_category, monitored_category_norms):
+    old_norm = normalize_category_name(old_category)
+    new_norm = normalize_category_name(new_category)
+    if old_norm == new_norm:
+        return True
+
+    # Si les deux catégories sont surveillées, un déplacement interne au
+    # périmètre ne doit pas transformer le film en nouveauté. En revanche, un
+    # passage depuis une ancienne catégorie non surveillée conserve la logique
+    # existante "entre dans le périmètre = nouveauté".
+    monitored = set(monitored_category_norms or ())
+    return bool(old_norm and new_norm and old_norm in monitored and new_norm in monitored)
+
+
+def find_movie_reassociation_candidate(
+    conn,
+    new_id,
+    identity,
+    new_category,
+    provider_movie_ids,
+    monitored_category_norms,
+):
+    """Retourne (ancienne_ligne, méthode) uniquement pour une correspondance unique."""
+    provider_movie_ids = {safe_text(x) for x in provider_movie_ids}
+
+    def eligible(rows, require_same_category=False):
+        out = []
+        new_category_norm = normalize_category_name(new_category)
+        for row in rows:
+            old_id = safe_text(row["id"])
+            if old_id in provider_movie_ids:
+                # Les deux IDs coexistent chez le fournisseur : surtout ne pas fusionner.
+                continue
+            if require_same_category:
+                if normalize_category_name(row["category"]) != new_category_norm:
+                    continue
+            elif not _movie_category_compatible(
+                row["category"], new_category, monitored_category_norms
+            ):
+                continue
+            out.append(row)
+        return out
+
+    def unique(rows, matched_by, require_same_category=False):
+        rows = eligible(rows, require_same_category=require_same_category)
+        if len(rows) == 1:
+            return rows[0], matched_by
+        # Ambiguïté = aucune fusion automatique.
+        return None, None
+
+    tmdb = safe_text(identity.get("tmdb_id")).strip()
+    if tmdb:
+        rows = conn.execute("""
+            SELECT * FROM movies
+            WHERE active=1 AND id<>? AND tmdb_id=?
+        """, (safe_text(new_id), tmdb)).fetchall()
+        if rows:
+            row, method = unique(rows, "tmdb")
+            if row is not None or len(eligible(rows)) > 1:
+                return row, method
+
+    imdb = safe_text(identity.get("imdb_id")).strip()
+    if imdb:
+        rows = conn.execute("""
+            SELECT * FROM movies
+            WHERE active=1 AND id<>? AND imdb_id=?
+        """, (safe_text(new_id), imdb)).fetchall()
+        if rows:
+            row, method = unique(rows, "imdb")
+            if row is not None or len(eligible(rows)) > 1:
+                return row, method
+
+    normalized = safe_text(identity.get("normalized_name")).strip()
+    year = identity.get("year")
+    if normalized and year:
+        rows = conn.execute("""
+            SELECT * FROM movies
+            WHERE active=1 AND id<>? AND normalized_name=? AND year=?
+        """, (safe_text(new_id), normalized, int(year))).fetchall()
+        # Le repli titre+année est volontairement plus strict qu'un identifiant
+        # externe exact : même catégorie obligatoire en V1.
+        return unique(rows, "title_year", require_same_category=True)
+
+    return None, None
+
+
+def reassociate_movie_id(
+    conn,
+    old_row,
+    new_id,
+    name,
+    category,
+    provider_added,
+    identity,
+    now,
+    matched_by,
+):
+    """Transfère la ligne vers le nouvel ID sans créer d'événement utilisateur."""
+    old_id = safe_text(old_row["id"])
+    new_id = safe_text(new_id)
+    conn.execute("""
+        UPDATE movies SET
+            id=?,
+            name=?,
+            category=?,
+            provider_added=COALESCE(?,provider_added),
+            normalized_name=?,
+            year=COALESCE(?,year),
+            tmdb_id=COALESCE(?,tmdb_id),
+            imdb_id=COALESCE(?,imdb_id),
+            last_seen=?,
+            active=1,
+            missing_count=0
+        WHERE id=?
+    """, (
+        new_id,
+        safe_text(name),
+        safe_text(category),
+        provider_added,
+        safe_text(identity.get("normalized_name")) or None,
+        identity.get("year"),
+        safe_text(identity.get("tmdb_id")) or None,
+        safe_text(identity.get("imdb_id")) or None,
+        now,
+        old_id,
+    ))
+    conn.execute("""
+        INSERT INTO movie_id_changes(
+            old_id,new_id,matched_by,detected_at,name,category
+        ) VALUES(?,?,?,?,?,?)
+    """, (
+        old_id,
+        new_id,
+        safe_text(matched_by),
+        now,
+        safe_text(name),
+        safe_text(category),
+    ))
+    print(
+        f"[INFO] Movie Identity V1: film réassocié {old_id} -> {new_id} "
+        f"({matched_by}, {safe_text(name)})",
+        flush=True,
+    )
+
+
 def init_db():
     with db() as c:
         c.executescript("""
@@ -353,6 +620,18 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_events_detected ON events(detected_at DESC);
 
+        CREATE TABLE IF NOT EXISTS movie_id_changes (
+            change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            old_id TEXT NOT NULL,
+            new_id TEXT NOT NULL,
+            matched_by TEXT NOT NULL,
+            detected_at TEXT NOT NULL,
+            name TEXT,
+            category TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_movie_id_changes_time
+            ON movie_id_changes(detected_at DESC);
+
         CREATE TABLE IF NOT EXISTS email_digest_queue (
             event_key TEXT PRIMARY KEY,
             queued_at TEXT NOT NULL
@@ -366,6 +645,34 @@ def init_db():
         # Migrations non destructives pour une base v2/v3 existante.
         ensure_column(c, "movies", "active", "INTEGER NOT NULL DEFAULT 1")
         ensure_column(c, "movies", "missing_count", "INTEGER NOT NULL DEFAULT 0")
+        # Movie Identity V1 : identité secondaire, additive et non destructive.
+        ensure_column(c, "movies", "normalized_name", "TEXT")
+        ensure_column(c, "movies", "year", "INTEGER")
+        ensure_column(c, "movies", "tmdb_id", "TEXT")
+        ensure_column(c, "movies", "imdb_id", "TEXT")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_movies_tmdb_id ON movies(tmdb_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_movies_imdb_id ON movies(imdb_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_movies_title_year ON movies(normalized_name,year)")
+
+        # Backfill léger des anciennes lignes : aucune requête réseau. Il permet
+        # au premier scan après mise à niveau de reconnaître déjà un changement
+        # d'ID via "titre normalisé + année" lorsque l'année est dans le nom.
+        movie_rows_to_backfill = c.execute("""
+            SELECT id,name,normalized_name,year
+            FROM movies
+            WHERE normalized_name IS NULL OR normalized_name=''
+        """).fetchall()
+        for movie_row in movie_rows_to_backfill:
+            inferred_year = movie_year_from_item({}, movie_row["name"])
+            c.execute("""
+                UPDATE movies SET normalized_name=?, year=COALESCE(year,?)
+                WHERE id=?
+            """, (
+                normalize_movie_title(movie_row["name"], inferred_year),
+                inferred_year,
+                movie_row["id"],
+            ))
+
         ensure_column(c, "series", "active", "INTEGER NOT NULL DEFAULT 1")
         ensure_column(c, "series", "missing_count", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(c, "categories", "active", "INTEGER NOT NULL DEFAULT 1")
@@ -709,6 +1016,7 @@ def _email_html_from_text(subject, body, lang="fr"):
 
     safe_subject = html.escape(safe_text(subject))
     safe_app = html.escape(APP_NAME)
+    safe_version = html.escape(APP_VERSION)
 
     if not digest_mode:
         safe_body = html.escape(raw_body)
@@ -725,7 +1033,7 @@ def _email_html_from_text(subject, body, lang="fr"):
 </td></tr>
 <tr><td style="padding:26px 28px;font-family:Arial,sans-serif;font-size:14px;line-height:1.65;color:#1f2937;white-space:pre-wrap;">{safe_body}</td></tr>
 <tr><td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:14px 28px;font-family:Arial,sans-serif;font-size:11px;color:#64748b;">
-{safe_app} · {html.escape(automatic_label)}
+{safe_app} · v{safe_version} · {html.escape(automatic_label)}
 </td></tr>
 </table>
 </td></tr></table>
@@ -937,7 +1245,7 @@ style="width:100%;max-width:640px;background:#ffffff;border-radius:16px;overflow
 <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:14px 28px;
 font-family:Arial,sans-serif;font-size:11px;line-height:1.5;color:#64748b;">
 {latest_html}<br>
-{safe_app} · {html.escape(automatic_label)}
+{safe_app} · v{safe_version} · {html.escape(automatic_label)}
 </td>
 </tr>
 
@@ -961,7 +1269,9 @@ def smtp_send(settings, subject, body):
     msg["To"] = ", ".join(recipients)
 
     # Toujours conserver une version texte.
-    msg.set_content(safe_text(body))
+    plain_body = safe_text(body).rstrip()
+    plain_body += f"\n\n{APP_NAME} · v{APP_VERSION}"
+    msg.set_content(plain_body)
 
     # Version HTML pour les clients compatibles.
     msg.add_alternative(
@@ -1156,7 +1466,22 @@ def build_email_digest(events, settings, period_start=None, period_end=None):
             "… details truncated; the totals above remain complete.",
         ))
 
-    lines.extend(["", f"{ui_text(lang, 'Dernier scan', 'Latest scan')} : {datetime.now(TZ).strftime('%d/%m/%Y %H:%M')}"])
+    try:
+        with db() as conn:
+            last_scan_dt = parse_local_iso(get_meta(conn, "last_success", ""))
+    except Exception:
+        last_scan_dt = None
+
+    last_scan_text = (
+        last_scan_dt.strftime("%d/%m/%Y %H:%M")
+        if last_scan_dt
+        else "—"
+    )
+
+    lines.extend([
+        "",
+        f"{ui_text(lang, 'Dernier scan', 'Latest scan')} : {last_scan_text}"
+    ])
     return subject, "\n".join(lines), selected
 
 
@@ -2466,9 +2791,13 @@ def process_pending_series(conn, scan_errors=None, monitored_categories=None):
 
                     new_rows = []
                     if since_dt:
+                        # Petite marge pour éviter de perdre un épisode ajouté
+                        # juste avant le scan précédent mais dont le changement
+                        # de série n'est visible qu'au scan suivant.
+                        episode_cutoff = since_dt - timedelta(minutes=10)
                         for e in current_eps:
                             added_dt = parse_epoch(e["provider_added"])
-                            if added_dt and added_dt >= since_dt:
+                            if added_dt and added_dt >= episode_cutoff:
                                 new_rows.append(e)
 
                 for e in new_rows:
@@ -2628,6 +2957,18 @@ def sync_once():
 
                 # Films présents
                 current_movie_ids = set()
+                monitored_vod_norm = {
+                    normalize_category_name(x) for x in selected_vod.values()
+                }
+                # Important pour Movie Identity V1 : on connaît à l'avance tous
+                # les IDs présents dans CE scan. Un ancien ID qui coexiste encore
+                # avec le nouveau ne sera donc jamais fusionné automatiquement.
+                provider_movie_ids = {
+                    safe_text(x.get("stream_id") or x.get("id"))
+                    for x in vod_items
+                    if safe_text(x.get("stream_id") or x.get("id"))
+                }
+
                 for m in vod_items:
                     mid = safe_text(m.get("stream_id") or m.get("id"))
                     if not mid:
@@ -2637,33 +2978,113 @@ def sync_once():
                     name = safe_text(m.get("name")) or f"Film {mid}"
                     cat = category_name_for(m, selected_vod)
                     added = safe_text(m.get("added")) or None
+                    identity = movie_identity_from_item(m, name)
+                    activation_baseline = item_is_activation_baseline(
+                        m, selected_vod, pending_vod_baselines
+                    )
 
                     row = conn.execute("SELECT * FROM movies WHERE id=?", (mid,)).fetchone()
 
                     if row is None:
-                        conn.execute("""
-                            INSERT INTO movies(
-                                id,name,category,provider_added,first_seen,last_seen,
-                                active,missing_count
-                            ) VALUES(?,?,?,?,?,?,1,0)
-                        """, (mid, name, cat, added, now, now))
+                        old_row = None
+                        matched_by = None
 
-                        activation_baseline = item_is_activation_baseline(
-                            m, selected_vod, pending_vod_baselines
-                        )
+                        # On ne fait cette recherche que lorsqu'une vraie nouveauté
+                        # pourrait être annoncée. Le tout premier baseline et le
+                        # baseline d'une catégorie nouvellement activée restent O(n).
                         if baseline and not activation_baseline:
-                            add_event(
-                                conn, f"movie:{mid}", "movie", mid,
-                                name, "", cat, added, now
+                            old_row, matched_by = find_movie_reassociation_candidate(
+                                conn,
+                                mid,
+                                identity,
+                                cat,
+                                provider_movie_ids,
+                                monitored_vod_norm,
                             )
-                    else:
+
+                        if old_row is not None:
+                            reassociate_movie_id(
+                                conn,
+                                old_row,
+                                mid,
+                                name,
+                                cat,
+                                added,
+                                identity,
+                                now,
+                                matched_by,
+                            )
+                            row = conn.execute(
+                                "SELECT * FROM movies WHERE id=?", (mid,)
+                            ).fetchone()
+                        else:
+                            conn.execute("""
+                                INSERT INTO movies(
+                                    id,name,category,provider_added,first_seen,last_seen,
+                                    active,missing_count,normalized_name,year,tmdb_id,imdb_id
+                                ) VALUES(?,?,?,?,?,?,1,0,?,?,?,?)
+                            """, (
+                                mid, name, cat, added, now, now,
+                                identity.get("normalized_name"),
+                                identity.get("year"),
+                                identity.get("tmdb_id"),
+                                identity.get("imdb_id"),
+                            ))
+
+                            if baseline and not activation_baseline:
+                                add_event(
+                                    conn, f"movie:{mid}", "movie", mid,
+                                    name, "", cat, added, now
+                                )
+
+                    if row is not None:
+                        old_category = safe_text(row["category"])
+
+                        # Certains fournisseurs réutilisent un même stream_id.
+                        # Si un film auparavant connu dans une catégorie non
+                        # surveillée apparaît maintenant dans une catégorie
+                        # surveillée, il s'agit bien d'une nouveauté pour
+                        # notre périmètre de surveillance.
+                        enters_monitored_scope = bool(
+                            old_category
+                            and normalize_category_name(old_category)
+                                not in monitored_vod_norm
+                        )
+
+                        if baseline and not activation_baseline and enters_monitored_scope:
+                            add_event(
+                                conn,
+                                event_key_transition("movie", mid),
+                                "movie",
+                                mid,
+                                name,
+                                "",
+                                cat,
+                                added,
+                                now
+                            )
+
                         conn.execute("""
                             UPDATE movies SET
                                 name=?,category=?,
                                 provider_added=COALESCE(?,provider_added),
+                                normalized_name=?,
+                                year=COALESCE(?,year),
+                                tmdb_id=COALESCE(?,tmdb_id),
+                                imdb_id=COALESCE(?,imdb_id),
                                 last_seen=?,active=1,missing_count=0
                             WHERE id=?
-                        """, (name, cat, added, now, mid))
+                        """, (
+                            name,
+                            cat,
+                            added,
+                            identity.get("normalized_name"),
+                            identity.get("year"),
+                            identity.get("tmdb_id"),
+                            identity.get("imdb_id"),
+                            now,
+                            mid,
+                        ))
 
                 # Séries présentes
                 current_series_ids = set()
@@ -3592,11 +4013,13 @@ button, input {{ font: inherit; }}
     padding: 24px 0 42px;
 }}
 .hero {{
-    background: linear-gradient(145deg, rgba(21,29,41,.96), rgba(13,18,27,.96));
-    border: 1px solid var(--line);
+    background: linear-gradient(180deg, #172233 0%, #0f1723 100%);
+    border: 1px solid #35455d;
     border-radius: 22px;
     padding: 20px;
-    box-shadow: 0 18px 60px rgba(0,0,0,.24);
+    box-shadow:
+        0 16px 42px rgba(0,0,0,.42),
+        inset 0 1px 0 rgba(255,255,255,.07);
 }}
 .hero-top {{
     display: flex;
@@ -3706,10 +4129,13 @@ h1 {{
     margin-top: 18px;
 }}
 .quick {{
-    background: rgba(255,255,255,.022);
-    border: 1px solid var(--line);
+    background: linear-gradient(180deg, #1b2738 0%, #111a27 100%);
+    border: 1px solid #35455d;
     border-radius: 14px;
     padding: 11px 12px;
+    box-shadow:
+        0 10px 26px rgba(0,0,0,.38),
+        inset 0 1px 0 rgba(255,255,255,.07);
 }}
 .quick-label {{
     color: var(--muted);
@@ -3762,10 +4188,13 @@ h1 {{
     display: flex;
     flex-direction:column;
     gap: 9px;
-    background: rgba(8,11,17,.88);
+    background: linear-gradient(180deg, #141e2c 0%, #0e151f 100%);
     backdrop-filter: blur(16px);
-    border: 1px solid var(--line);
+    border: 1px solid #304158;
     border-radius: 16px;
+    box-shadow:
+        0 12px 32px rgba(0,0,0,.38),
+        inset 0 1px 0 rgba(255,255,255,.055);
 }}
 .toolbar-main {{
     width:100%;
@@ -3774,10 +4203,16 @@ h1 {{
     gap:9px;
 }}
 .toolbar-actions {{
-    display:flex;
+    display:grid;
+    grid-template-columns:repeat(2,max-content);
     align-items:center;
     gap:7px;
     flex:0 0 auto;
+}}
+.toolbar-actions .scan-now-btn,
+.toolbar-actions .backup-now-btn {{
+    padding:10px 13px;
+    border-radius:10px;
 }}
 .periods, .filters {{
     display: flex;
@@ -3823,11 +4258,14 @@ h1 {{
     margin-bottom: 16px;
 }}
 .stat {{
-    background: var(--panel);
-    border: 1px solid var(--line);
+    background: linear-gradient(180deg, #1b2738 0%, #111a27 100%);
+    border: 1px solid #35455d;
     border-radius: 16px;
     padding: 13px;
     min-width: 0;
+    box-shadow:
+        0 12px 30px rgba(0,0,0,.40),
+        inset 0 1px 0 rgba(255,255,255,.07);
 }}
 .stat strong {{
     display: block;
@@ -3840,11 +4278,14 @@ h1 {{
     font-size: 12px;
 }}
 .section {{
-    background: var(--panel);
-    border: 1px solid var(--line);
+    background: linear-gradient(180deg, #182334 0%, #101824 100%);
+    border: 1px solid #304158;
     border-radius: 17px;
-    margin-bottom: 10px;
+    margin-bottom: 12px;
     overflow: hidden;
+    box-shadow:
+        0 12px 32px rgba(0,0,0,.38),
+        inset 0 1px 0 rgba(255,255,255,.055);
 }}
 .section > summary {{
     list-style: none;
@@ -4038,13 +4479,16 @@ h1 {{
     font-weight:700;
 }}
 .system-card {{
-    background: var(--panel);
-    border: 1px solid var(--line);
+    background: linear-gradient(180deg, #1b2738 0%, #111a27 100%);
+    border: 1px solid #35455d;
     border-radius: 16px;
     padding: 14px;
     color: var(--muted);
     font-size: 12px;
     line-height: 1.75;
+    box-shadow:
+        0 12px 30px rgba(0,0,0,.40),
+        inset 0 1px 0 rgba(255,255,255,.07);
 }}
 .system-card b {{ color: var(--text); }}
 .watcher-errors {{
@@ -4097,7 +4541,6 @@ code {{
 @media (max-width: 680px) {{
     .wrap {{ width: min(100% - 18px, 1180px); padding-top: 10px; }}
     .hero {{ border-radius: 17px; padding: 16px; }}
-    .quick-status {{ grid-template-columns: repeat(2, minmax(0,1fr)); }}
     .stats {{ grid-template-columns: repeat(2, minmax(0,1fr)); }}
     .toolbar {{ position: static; }}
     .toolbar-main {{ flex-wrap:wrap; }}
@@ -4328,6 +4771,8 @@ code {{
                     <path d="M17.9 15a7 7 0 0 1-11.5 2.6L4 13"/>
                 </svg>{L("Actualiser", "Refresh")}
             </button>
+            <button type="button" class="scan-now-btn" id="runScanQuick">{L("Scanner maintenant", "Scan now")}</button>
+            <button type="button" class="backup-now-btn" id="runBackupQuick">{L("Sauvegarder maintenant", "Back up now")}</button>
         </div>
     </div>
 
@@ -4634,6 +5079,8 @@ const cancelSettings = document.getElementById('cancelSettings');
 const categorySearch = document.getElementById('categorySearch');
 
 let pageRefreshTimer = null;
+let refreshAfterScanPending = false;
+let knownLastSuccessIso = {json.dumps(scan_status.get("last_success_iso", ""), ensure_ascii=False)};
 const PAGE_REFRESH_MS = 300000;
 
 function schedulePageRefresh() {{
@@ -4661,6 +5108,10 @@ function setSettingsOpen(open) {{
             pageRefreshTimer = null;
         }}
     }} else {{
+        if (refreshAfterScanPending) {{
+            location.reload();
+            return;
+        }}
         // Repart sur 5 minutes complètes après fermeture des paramètres.
         schedulePageRefresh();
     }}
@@ -4710,6 +5161,16 @@ if (categorySearch) categorySearch.addEventListener('input', () => {{
 
 const runBackupNow = document.getElementById('runBackupNow');
 const runScanNow = document.getElementById('runScanNow');
+const runBackupQuick = document.getElementById('runBackupQuick');
+const runScanQuick = document.getElementById('runScanQuick');
+
+const scanActionButtons = [runScanNow, runScanQuick].filter(Boolean);
+const backupActionButtons = [runBackupNow, runBackupQuick].filter(Boolean);
+
+backupActionButtons.forEach(btn => {{
+    btn.dataset.idleText = btn.textContent;
+}});
+
 const testEmailBtn = document.getElementById('testEmailBtn');
 const scanIntervalMode = document.getElementById('scanIntervalMode');
 const scanIntervalCustom = document.getElementById('scanIntervalCustom');
@@ -4789,25 +5250,43 @@ function applyScanStatus(status) {{
     if (quickLast) quickLast.textContent = last;
     if (quickNext) quickNext.textContent = `≈ ${{next}}`;
     if (systemInterval) systemInterval.textContent = interval;
-    if (runScanNow) {{
-        runScanNow.disabled = !!status.running;
-        runScanNow.textContent = status.running ? TXT.scanRunning : TXT.scanNow;
-    }}
+    scanActionButtons.forEach(btn => {{
+        btn.disabled = !!status.running;
+        btn.textContent = status.running ? TXT.scanRunning : TXT.scanNow;
+    }});
 }}
 
 async function refreshScanStatus() {{
     try {{
         const response = await fetch('/api/scan/status', {{ cache: 'no-store' }});
         if (!response.ok) return;
-        applyScanStatus(await response.json());
+
+        const status = await response.json();
+        applyScanStatus(status);
+
+        const latestSuccessIso = status.last_success_iso || '';
+        if (latestSuccessIso && latestSuccessIso !== knownLastSuccessIso) {{
+            knownLastSuccessIso = latestSuccessIso;
+
+            // Ne jamais couper une utilisation des paramètres en cours.
+            if (settingsModal && settingsModal.classList.contains('open')) {{
+                refreshAfterScanPending = true;
+            }} else {{
+                location.reload();
+                return;
+            }}
+        }}
     }} catch (err) {{
         // Le polling du scan ne doit jamais perturber l'interface.
     }}
 }}
 
-if (runScanNow) runScanNow.addEventListener('click', async () => {{
-    runScanNow.disabled = true;
-    runScanNow.textContent = TXT.launching;
+async function handleRunScanNow() {{
+    scanActionButtons.forEach(btn => {{
+        btn.disabled = true;
+        btn.textContent = TXT.launching;
+    }});
+
     try {{
         const response = await fetch('/scan/run?ajax=1', {{
             method: 'POST',
@@ -4815,17 +5294,25 @@ if (runScanNow) runScanNow.addEventListener('click', async () => {{
             body: new URLSearchParams({{ return_days: String({days}) }}),
         }});
         const result = await response.json();
+
         if (!response.ok || !result.ok) {{
             throw new Error(result.error || TXT.scanStartFailed);
         }}
+
         applyScanStatus(result.status);
         showToast(TXT.scanStarted, 'success');
+
     }} catch (err) {{
         showToast(`${{TXT.scanFailed}}: ${{err.message || err}}`, 'error');
-        runScanNow.disabled = false;
-        runScanNow.textContent = TXT.scanNow;
+
+        scanActionButtons.forEach(btn => {{
+            btn.disabled = false;
+            btn.textContent = TXT.scanNow;
+        }});
     }}
-}});
+}}
+
+scanActionButtons.forEach(btn => btn.addEventListener('click', handleRunScanNow));
 
 function applyBackupStatus(status) {{
     if (!status) return;
@@ -4870,13 +5357,15 @@ async function refreshBackupStatus() {{
     }}
 }}
 
-if (runBackupNow) runBackupNow.addEventListener('click', async () => {{
+async function handleRunBackupNow() {{
     const ok = confirm(TXT.backupConfirm);
     if (!ok) return;
 
-    const originalText = runBackupNow.textContent;
-    runBackupNow.disabled = true;
-    runBackupNow.textContent = TXT.backingUp;
+    backupActionButtons.forEach(btn => {{
+        btn.disabled = true;
+        btn.textContent = TXT.backingUp;
+    }});
+
     try {{
         const response = await fetch('/backup/run?ajax=1', {{
             method: 'POST',
@@ -4884,22 +5373,37 @@ if (runBackupNow) runBackupNow.addEventListener('click', async () => {{
             body: new URLSearchParams({{ return_days: String({days}) }}),
         }});
         const result = await response.json();
+
         if (!response.ok || !result.ok) {{
             throw new Error(result.error || TXT.backupFailed);
         }}
+
         applyBackupStatus(result.status);
-        runBackupNow.textContent = TXT.backupDone;
+
+        backupActionButtons.forEach(btn => {{
+            btn.textContent = TXT.backupDone;
+        }});
+
         showToast(TXT.backupDone, 'success');
+
         setTimeout(() => {{
-            runBackupNow.textContent = originalText;
-            runBackupNow.disabled = false;
+            backupActionButtons.forEach(btn => {{
+                btn.textContent = btn.dataset.idleText;
+                btn.disabled = false;
+            }});
         }}, 1600);
+
     }} catch (err) {{
         showToast(`${{TXT.backupImpossible}}: ${{err.message || err}}`, 'error');
-        runBackupNow.textContent = originalText;
-        runBackupNow.disabled = false;
+
+        backupActionButtons.forEach(btn => {{
+            btn.textContent = btn.dataset.idleText;
+            btn.disabled = false;
+        }});
     }}
-}});
+}}
+
+backupActionButtons.forEach(btn => btn.addEventListener('click', handleRunBackupNow));
 
 if (testEmailBtn) testEmailBtn.addEventListener('click', async () => {{
     const originalText = testEmailBtn.textContent;
@@ -4936,13 +5440,20 @@ if (settingsForm) settingsForm.addEventListener('submit', async (e) => {{
     e.preventDefault();
 
     const digestSelect = settingsForm.querySelector('#emailDigestHours');
+    const emailEnabled = settingsForm.querySelector('input[name="email_enabled"]');
+
     if (
         digestSelect &&
+        emailEnabled &&
+        emailEnabled.checked &&
         digestSelect.value === '0' &&
         digestSelect.dataset.savedValue !== '0'
     ) {{
         const ok = confirm(TXT.immediateWarning);
-        if (!ok) return;
+        if (!ok) {{
+            digestSelect.value = digestSelect.dataset.savedValue || '2';
+            return;
+        }}
     }}
 
     const submitBtn = settingsForm.querySelector('.save-btn');
