@@ -3,6 +3,8 @@
 [English](README.md)
 
 Xtream What's New est une application Docker légère qui surveille un catalogue VOD et Séries compatible Xtream et affiche ce qui a changé depuis les scans précédents.
+![Tableau de bord Xtream What's New](docs/images/dashboard.png)
+
 
 Elle ne lit ni ne retransmet les flux : elle surveille uniquement les métadonnées du catalogue exposées par l'API du fournisseur.
 
