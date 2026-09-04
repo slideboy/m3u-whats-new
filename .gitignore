@@ -9,3 +9,5 @@ Thumbs.db
 data/*.sqlite3
 data/*.sqlite3-*
 data/backups/
+
+.env.dev
