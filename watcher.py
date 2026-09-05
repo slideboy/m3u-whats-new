@@ -5339,15 +5339,11 @@ code {{
         <span class="system-value" id="catalogSeriesCategoryCount">{enabled_series_category_count}</span> {L("catégories Séries", "Series categories")}
     </div>
     <div class="system-card">
-        <b>{L("Système", "System")}</b><br>
-        {L("Intervalle", "Interval")} : <span class="system-value" id="scanSystemInterval">{html.escape(interval)}</span> min ·
-        {L("Rétention", "Retention")} : <span class="system-value">{html.escape(retention)}</span> {L("j", "d")}<br>
-        {L("Suppression confirmée après", "Removal confirmed after")} {html.escape(confirm_scans)} scans ·
+        <b>{L("État de l’application", "Application status")}</b><br>
+        {L("Scan automatique", "Automatic scan")} : <span class="system-value" id="scanSystemInterval">{html.escape(interval)}</span> min<br>
         {L("Notifications", "Notifications")} : <span class="system-value" id="notificationSystemStatus">{notif_status}</span><br>
-        {L("Sauvegardes conservées", "Backups kept")} : <span class="system-value" id="backupSystemCount">{html.escape(str(backup["count"]))}</span> ·
-        {L("Total", "Total")} : <span class="system-value" id="backupSystemTotalSize">{html.escape(backup["total_size"])}</span><br>
-        {L("Dernière", "Latest")} : <span class="system-value" id="backupSystemDetail">{html.escape(backup["detail"])}</span> ·
-        <span class="system-value" id="backupSystemLatestSize">{html.escape(backup["latest_size"])}</span><br>
+        {L("Sauvegardes", "Backups")} : <span class="system-value" id="backupSystemCount">{html.escape(str(backup["count"]))}</span> {L("fichiers", "files")} ·
+        <span class="system-value" id="backupSystemTotalSize">{html.escape(backup["total_size"])}</span><br>
         {L("Séries en attente", "Series pending")} : <span class="system-value">{pending}</span>
     </div>
 </section>
