@@ -36,7 +36,7 @@ EMAIL_CHECK_SECONDS = 15
 EMAIL_RETRY_MINUTES = 10
 
 APP_NAME = "Xtream What's New"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5-dev"
 APP_USER_AGENT = f"Mozilla/5.0 Xtream-Whats-New/{APP_VERSION}"
 
 def utc_now():
@@ -4177,6 +4177,11 @@ def render_page(days):
     scan_status = get_scan_status(lang)
     backup = get_backup_status(lang)
 
+    try:
+        db_size = f"{DB_PATH.stat().st_size / (1024 * 1024):.1f} MB"
+    except Exception:
+        db_size = "—"
+
     kind_labels = {
         "movie": ("film", "🎬"),
         "series": ("serie", "📺"),
@@ -5339,16 +5344,12 @@ code {{
         <span class="system-value" id="catalogSeriesCategoryCount">{enabled_series_category_count}</span> {L("catégories Séries", "Series categories")}
     </div>
     <div class="system-card">
-        <b>{L("Système", "System")}</b><br>
-        {L("Intervalle", "Interval")} : <span class="system-value" id="scanSystemInterval">{html.escape(interval)}</span> min ·
-        {L("Rétention", "Retention")} : <span class="system-value">{html.escape(retention)}</span> {L("j", "d")}<br>
-        {L("Suppression confirmée après", "Removal confirmed after")} {html.escape(confirm_scans)} scans ·
+        <b>{L("État de l’application", "Application status")}</b><br>
+        {L("Scan automatique", "Automatic scan")} : <span class="system-value" id="scanSystemInterval">{html.escape(interval)}</span> min<br>
         {L("Notifications", "Notifications")} : <span class="system-value" id="notificationSystemStatus">{notif_status}</span><br>
-        {L("Sauvegardes conservées", "Backups kept")} : <span class="system-value" id="backupSystemCount">{html.escape(str(backup["count"]))}</span> ·
-        {L("Total", "Total")} : <span class="system-value" id="backupSystemTotalSize">{html.escape(backup["total_size"])}</span><br>
-        {L("Dernière", "Latest")} : <span class="system-value" id="backupSystemDetail">{html.escape(backup["detail"])}</span> ·
-        <span class="system-value" id="backupSystemLatestSize">{html.escape(backup["latest_size"])}</span><br>
-        {L("Séries en attente", "Series pending")} : <span class="system-value">{pending}</span>
+        {L("Sauvegardes", "Backups")} : <span class="system-value" id="backupSystemCount">{html.escape(str(backup["count"]))}</span> {L("fichiers", "files")} ·
+        <span class="system-value" id="backupSystemTotalSize">{html.escape(backup["total_size"])}</span><br>
+        {L("Base de données", "Database")} : <span class="system-value">{db_size}</span>
     </div>
 </section>
 
@@ -5385,6 +5386,7 @@ const TXT = {{
     emailEnabled: {json.dumps(L('Email activé', 'Email enabled'), ensure_ascii=False)},
     disabled: {json.dumps(L('Désactivées', 'Disabled'), ensure_ascii=False)},
     scanRunning: {json.dumps(L('Scan en cours…', 'Scan running…'), ensure_ascii=False)},
+    scanFinished: {json.dumps(L('Scan terminé ✅', 'Scan completed ✅'), ensure_ascii=False)},
     scanNow: {json.dumps(L('Scanner maintenant', 'Scan now'), ensure_ascii=False)},
     scanStarted: {json.dumps(L('Scan lancé ✓', 'Scan started ✓'), ensure_ascii=False)},
     launching: {json.dumps(L('Lancement…', 'Starting…'), ensure_ascii=False)},
@@ -5607,6 +5609,9 @@ const categorySearch = document.getElementById('categorySearch');
 let pageRefreshTimer = null;
 let refreshAfterScanPending = false;
 let knownLastSuccessIso = {json.dumps(scan_status.get("last_success_iso", ""), ensure_ascii=False)};
+let scanFinishedTimer = null;
+let previousScanRunning = false;
+let scanFinishedDisplayUntil = 0;
 const PAGE_REFRESH_MS = 300000;
 
 function schedulePageRefresh() {{
@@ -5759,10 +5764,16 @@ function applySettingsSummary(summary) {{
     }}
 }}
 
-function applyScanStatus(status) {{
+function applyScanStatus(status, scanJustFinished = false) {{
     if (!status) return;
+    if (Date.now() < scanFinishedDisplayUntil) {{
+    const quickNext = document.getElementById('nextScanValue');
+    if (quickNext) quickNext.textContent = TXT.scanFinished;
+}}
     const last = status.last_detail || '—';
     const next = status.next_detail || '—';
+    const wasRunning = previousScanRunning;
+    previousScanRunning = !!status.running;
     const interval = String(status.interval_minutes ?? '—');
 
     const settingsLast = document.getElementById('scanSettingsLast');
@@ -5774,7 +5785,21 @@ function applyScanStatus(status) {{
     if (settingsLast) settingsLast.textContent = last;
     if (settingsNext) settingsNext.textContent = next;
     if (quickLast) quickLast.textContent = last;
-    if (quickNext) quickNext.textContent = `≈ ${{next}}`;
+    if (quickNext) {{
+    if (scanJustFinished) {{
+        scanFinishedDisplayUntil = Date.now() + 3000;
+
+        quickNext.textContent = TXT.scanFinished;
+
+        clearTimeout(scanFinishedTimer);
+        scanFinishedTimer = setTimeout(() => {{
+            scanFinishedDisplayUntil = 0;
+        }}, 3000);
+
+    }} else if (Date.now() >= scanFinishedDisplayUntil) {{
+        quickNext.textContent = `≈ ${{next}}`;
+    }}
+}}
     if (systemInterval) systemInterval.textContent = interval;
     scanActionButtons.forEach(btn => {{
         btn.disabled = !!status.running;
@@ -5788,17 +5813,25 @@ async function refreshScanStatus() {{
         if (!response.ok) return;
 
         const status = await response.json();
-        applyScanStatus(status);
 
         const latestSuccessIso = status.last_success_iso || '';
-        if (latestSuccessIso && latestSuccessIso !== knownLastSuccessIso) {{
-            knownLastSuccessIso = latestSuccessIso;
+        const scanJustFinished = latestSuccessIso && latestSuccessIso !== knownLastSuccessIso;
+
+        if (scanJustFinished) {{
+        knownLastSuccessIso = latestSuccessIso;
+}}
+
+applyScanStatus(status, scanJustFinished);
+
+if (scanJustFinished) {{
 
             // Ne jamais couper une utilisation des paramètres en cours.
             if (settingsModal && settingsModal.classList.contains('open')) {{
                 refreshAfterScanPending = true;
             }} else {{
-                location.reload();
+                setTimeout(() => {{
+                    location.reload();
+                }}, 3000);
                 return;
             }}
         }}
